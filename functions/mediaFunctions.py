@@ -22,7 +22,7 @@ def constructSeriesTitle(season = None, episode = None, folder: bool = False):
             title_season = f"Season {season}"
         else:
             title_season = f"S{season:02}"
-    
+
     if isinstance(episode, list):
         # get first and last episode
         title_episode = f"E{episode[0]:02}-E{episode[-1]:02}"
@@ -37,7 +37,7 @@ def constructSeriesTitle(season = None, episode = None, folder: bool = False):
         return title_episode
     else:
         return None
-    
+
 def cleanTitle(title: str):
     """
     Removes invalid characters from the title.
@@ -45,7 +45,7 @@ def cleanTitle(title: str):
     title = re.sub(r"[\/\\\:\*\?\"\<\>\|]", "", title)
     return title
 
-def cleanYear(year: str | int):
+def cleanYear(year: str | int | None):
     """
     Cleans the year listing which can be a string (2023-2024) or an int (2023).
     """

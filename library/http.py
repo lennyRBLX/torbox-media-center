@@ -64,10 +64,10 @@ general_http_client = httpx.Client(
 def requestWrapper(client: httpx.Client, method: str, url: str, use_cache: bool = True, **kwargs) -> httpx.Response:
     max_retries = 5
     backoff_factor = 1.5
-    
+
     cacheable = use_cache and method.upper() == "GET" # only caching GET requests
     cache_key = None
-    
+
     if cacheable:
         cache_key = makeCacheKey(method, url, str(client.base_url), **kwargs)
         if cache_key in _cache:
@@ -77,21 +77,29 @@ def requestWrapper(client: httpx.Client, method: str, url: str, use_cache: bool 
                 return cached_response
             else:
                 del _cache[cache_key]
-    
+
     for attempt in range(max_retries):
         try:
             response = client.request(method, url, **kwargs)
             response.raise_for_status()
-            
+
             if cacheable and cache_key:
                 _cache[cache_key] = (time.time(), response)
                 logging.debug(f"Cached response for {url}")
-            
+
             return response
         except httpx.HTTPStatusError as e:
             bad_response_codes = [429]
             if e.response.status_code in bad_response_codes:
                 wait_time = backoff_factor * (2 ** attempt)
+                retry_after_header = e.response.headers.get("Retry-After")
+                if retry_after_header is not None:
+                    try:
+                        retry_after_seconds = float(retry_after_header)
+                        if retry_after_seconds > wait_time:
+                            wait_time = retry_after_seconds
+                    except ValueError:
+                        pass
                 logging.warning(f"Received {e.response.status_code} for {url}. Retrying in {wait_time:.2f} seconds...")
                 time.sleep(wait_time)
             else:
