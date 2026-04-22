@@ -1,12 +1,14 @@
-from library.http import api_http_client, search_api_http_client, general_http_client, requestWrapper
+from library.http import api_http_client, search_api_http_client, general_http_client, tmdb_http_client, requestWrapper
 import httpx
 from enum import Enum
 import PTN
 from library.torbox import TORBOX_API_KEY
-from library.app import SCAN_METADATA
-from functions.mediaFunctions import constructSeriesTitle, cleanTitle, cleanYear
-from functions.databaseFunctions import insertData, getDatabase, getDatabaseLock
+from library.app import SCAN_METADATA, TMDB_API_KEY
+from functions.mediaFunctions import constructSeriesTitle, cleanTitle, cleanYear, normaliseTitle, scoreTmdbResult, TMDB_SCORE_THRESHOLD
+from rapidfuzz import fuzz
+from functions.databaseFunctions import upsertData, getDatabase, getDatabaseLock
 import os
+import re
 import logging
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,8 +17,27 @@ from tinydb import Query
 import hashlib
 import json
 import time
-import re
-from difflib import SequenceMatcher
+import threading
+from datetime import datetime, timezone
+
+# --- Diagnostics log file ---
+DIAG_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmdb_diagnostics.log")
+_diag_lock = threading.Lock()
+
+
+def _reset_diag_log():
+    """Clear the diagnostics log at the start of each refresh cycle."""
+    with _diag_lock:
+        with open(DIAG_LOG_PATH, "w", encoding="utf-8") as f:
+            f.write(f"=== TMDB Diagnostics Log — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} ===\n\n")
+
+
+def diag(message: str):
+    """Write a line to both stdout and the diagnostics log file."""
+    print(message)
+    with _diag_lock:
+        with open(DIAG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(message + "\n")
 
 class DownloadType(Enum):
     torrent = "torrents"
@@ -37,9 +58,7 @@ METADATA_CACHE_DB_NAME = "metadata_cache"
 METADATA_CACHE_SCHEMA_VERSION = 2
 METADATA_CACHE_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 days
 METADATA_FAILURE_CACHE_TTL_SECONDS = 60 * 60 * 6  # 6 hours
-METADATA_MAX_WORKERS = 2
-METADATA_IDENTITY_CACHE_PREFIX = "metadata_identity"
-METADATA_MIN_SCORE = 35.0
+METADATA_MAX_WORKERS = 15
 
 def getMetadataCacheKey(download_type: DownloadType, item: dict, file: dict):
     cache_key_data = {
@@ -114,250 +133,6 @@ def pruneExpiredMetadataCache():
         if removed:
             logging.info(f"Pruned {len(removed)} expired metadata cache entries.")
 
-def normalizeTitle(value: str | None):
-    if not value:
-        return ""
-
-    normalized = cleanTitle(str(value)).lower()
-    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    return normalized
-
-def containsSpecialKeyword(value: str | None):
-    normalized = normalizeTitle(value)
-    return re.search(r"\b(special|specials|extra|extras|bonus|ova|oav|webisode|webisodes|webepisode|webepisodes)\b", normalized) is not None
-
-def parseSeasonEpisodeFromText(text: str | None):
-    if not text:
-        return None, None
-
-    match = re.search(r"\bs(\d{1,2})[ ._-]*e(\d{1,3})\b", text, re.IGNORECASE)
-    if match:
-        return int(match.group(1)), int(match.group(2))
-
-    match = re.search(r"\b(\d{1,2})x(\d{1,3})\b", text, re.IGNORECASE)
-    if match:
-        return int(match.group(1)), int(match.group(2))
-
-    match = re.search(r"\bseason[ ._-]*(\d{1,2})[ ._-]*(?:episode|ep)?[ ._-]*(\d{1,3})\b", text, re.IGNORECASE)
-    if match:
-        return int(match.group(1)), int(match.group(2))
-
-    match = re.search(r"\bseason[ ._-]*(\d{1,2})\b", text, re.IGNORECASE)
-    if match:
-        return int(match.group(1)), None
-
-    return None, None
-
-def getParsedSeasonEpisode(title_data: dict, file_name: str, file_path: str | None) -> tuple[int | None, int | None, bool]:
-    raw_season = title_data.get("season")
-    raw_episode = title_data.get("episode")
-
-    parsed_season: int | None = None
-    parsed_episode: int | None = None
-
-    if isinstance(raw_season, list) and raw_season:
-        if isinstance(raw_season[0], int):
-            parsed_season = raw_season[0]
-    elif isinstance(raw_season, int):
-        parsed_season = raw_season
-
-    if isinstance(raw_episode, list) and raw_episode:
-        if isinstance(raw_episode[0], int):
-            parsed_episode = raw_episode[0]
-    elif isinstance(raw_episode, int):
-        parsed_episode = raw_episode
-
-    fallback_season, fallback_episode = parseSeasonEpisodeFromText(file_name)
-
-    if parsed_season is None and fallback_season is not None:
-        parsed_season = fallback_season
-    if parsed_episode is None and fallback_episode is not None:
-        parsed_episode = fallback_episode
-
-    if parsed_season is None:
-        path_season, _ = parseSeasonEpisodeFromText(file_path)
-        if path_season is not None:
-            parsed_season = path_season
-
-    is_special_request = parsed_season == 0
-
-    if not is_special_request and (containsSpecialKeyword(file_name) or containsSpecialKeyword(file_path)):
-        is_special_request = True
-        if parsed_season is None:
-            parsed_season = 0
-
-    return parsed_season, parsed_episode, is_special_request
-
-def getIdentityCacheKey(download_type: DownloadType, item_hash: str | None, item_id: int | None):
-    if item_hash:
-        identity_value = item_hash
-    elif item_id is not None:
-        identity_value = str(item_id)
-    else:
-        return None
-
-    return f"{METADATA_IDENTITY_CACHE_PREFIX}:item:{download_type.value}:{identity_value}"
-
-def getSeriesIdentityCacheKeys(title: str | None, year: str | int | None):
-    normalized_title = normalizeTitle(title)
-    if not normalized_title:
-        return []
-
-    keys = [f"{METADATA_IDENTITY_CACHE_PREFIX}:series:{normalized_title}"]
-    cleaned_year = cleanYear(year)
-    if cleaned_year is not None:
-        keys.insert(0, f"{METADATA_IDENTITY_CACHE_PREFIX}:series:{normalized_title}:{cleaned_year}")
-
-    return keys
-
-def getCachedIdentity(cache_key: str | None):
-    if cache_key is None:
-        return None
-
-    cached = getCachedMetadata(cache_key)
-    if cached is None:
-        return None
-
-    cached_metadata, cached_success, _ = cached
-    if not cached_success or not isinstance(cached_metadata, dict):
-        return None
-
-    return cached_metadata
-
-def scoreMetadataCandidate(candidate: dict, normalized_query: str, query_year: int | None, expects_series: bool, is_special_request: bool):
-    candidate_title = candidate.get("title")
-    candidate_type = candidate.get("type")
-    normalized_candidate = normalizeTitle(candidate_title)
-
-    if not normalized_candidate:
-        return -100.0
-
-    similarity_score = SequenceMatcher(None, normalized_query, normalized_candidate).ratio() if normalized_query else 0.0
-
-    query_tokens = set(normalized_query.split())
-    candidate_tokens = set(normalized_candidate.split())
-    token_overlap = 0.0
-    if query_tokens:
-        token_overlap = len(query_tokens.intersection(candidate_tokens)) / len(query_tokens)
-
-    score = (similarity_score * 70.0) + (token_overlap * 30.0)
-
-    if expects_series:
-        if candidate_type in ("series", "anime"):
-            score += 25.0
-        else:
-            score -= 30.0
-    elif candidate_type == "movie":
-        score += 10.0
-
-    candidate_year = cleanYear(candidate.get("releaseYears"))
-    if query_year is not None and candidate_year is not None:
-        if query_year == candidate_year:
-            score += 10.0
-        elif abs(query_year - candidate_year) <= 1:
-            score += 5.0
-        else:
-            score -= 8.0
-
-    candidate_is_special = containsSpecialKeyword(candidate_title)
-    if is_special_request:
-        if candidate_is_special:
-            score += 12.0
-    else:
-        if candidate_is_special:
-            score -= 18.0
-
-    if normalized_query and normalized_query == normalized_candidate:
-        score += 10.0
-    elif normalized_query and normalized_query in normalized_candidate:
-        score += 5.0
-
-    if candidate_type not in ("movie", "series", "anime"):
-        score -= 20.0
-
-    return score
-
-def selectBestMetadataCandidate(metadata_results: list[dict], normalized_query: str, query_year: int | None, expects_series: bool, is_special_request: bool):
-    best_candidate = None
-    best_score = float("-inf")
-
-    for candidate in metadata_results:
-        score = scoreMetadataCandidate(
-            candidate,
-            normalized_query=normalized_query,
-            query_year=query_year,
-            expects_series=expects_series,
-            is_special_request=is_special_request,
-        )
-
-        if score > best_score:
-            best_score = score
-            best_candidate = candidate
-
-    return best_candidate, best_score
-
-def buildIdentityMetadata(candidate: dict, title_data: dict, item_name: str | None):
-    metadata_title = cleanTitle(candidate.get("title") or title_data.get("title") or item_name or "Unknown")
-    metadata_year = cleanYear(title_data.get("year") or candidate.get("releaseYears"))
-    metadata_type = candidate.get("type")
-
-    if metadata_type not in ("movie", "series", "anime"):
-        metadata_type = "movie"
-
-    metadata_rootfoldername = metadata_title
-    if metadata_year is not None:
-        metadata_rootfoldername = f"{metadata_title} ({metadata_year})"
-
-    return {
-        "metadata_title": metadata_title,
-        "metadata_link": candidate.get("link"),
-        "metadata_mediatype": metadata_type,
-        "metadata_image": candidate.get("image"),
-        "metadata_backdrop": candidate.get("backdrop"),
-        "metadata_years": metadata_year,
-        "metadata_rootfoldername": metadata_rootfoldername,
-    }
-
-def buildMetadataFromIdentity(identity_metadata: dict, base_metadata: dict, extension: str, parsed_season: int | None, parsed_episode: int | None, is_special_request: bool):
-    metadata = dict(base_metadata)
-    metadata.update(identity_metadata)
-
-    media_type = metadata.get("metadata_mediatype")
-    metadata_title = metadata.get("metadata_title") or base_metadata.get("metadata_title")
-
-    if media_type in ("series", "anime"):
-        normalized_season = parsed_season
-        if normalized_season is None:
-            normalized_season = 0 if is_special_request else 1
-
-        if normalized_season == 0:
-            metadata_foldername = "Specials"
-        else:
-            metadata_foldername = constructSeriesTitle(season=normalized_season, folder=True)
-
-        series_identifier = constructSeriesTitle(season=normalized_season, episode=parsed_episode)
-        if series_identifier:
-            metadata_filename = f"{metadata_title} {series_identifier}{extension}"
-        else:
-            metadata_filename = f"{metadata_title}{extension}"
-
-        metadata["metadata_foldername"] = metadata_foldername
-        metadata["metadata_season"] = normalized_season
-        metadata["metadata_episode"] = parsed_episode
-        metadata["metadata_filename"] = metadata_filename
-    elif media_type == "movie":
-        metadata_year = metadata.get("metadata_years")
-        if metadata_year is not None:
-            metadata["metadata_filename"] = f"{metadata_title} ({metadata_year}){extension}"
-        else:
-            metadata["metadata_filename"] = f"{metadata_title}{extension}"
-        metadata["metadata_foldername"] = None
-        metadata["metadata_season"] = None
-        metadata["metadata_episode"] = None
-
-    return metadata
-
 def process_file(item, file, type):
     """Process a single file and return the processed data"""
     short_name = file.get("short_name") or file.get("name") or str(file.get("id"))
@@ -377,6 +152,7 @@ def process_file(item, file, type):
         "DEBUG_file_name": short_name,
         "folder_hash": item.get("hash"),
         "file_id": file.get("id"),
+        "stable_key": f"{item.get('hash')}:{file.get('id')}",
         "file_name": short_name,
         "file_size": file.get("size"),
         "file_mimetype": mimetype,
@@ -391,20 +167,27 @@ def process_file(item, file, type):
         item_name = title_data.get("title", short_name)
         data["folder_name"] = item_name
 
-    parsed_season, parsed_episode, is_special_request = getParsedSeasonEpisode(
-        title_data,
-        short_name,
-        file.get("name"),
-    )
+    # Skip episode-only files with no folder/torrent context to identify the show.
+    # e.g. "226 - Wizard of Odd.mkv" or "S01E04. Golem.mkv" uploaded as single files.
+    file_stem = os.path.splitext(short_name)[0]
+    is_episode_only = bool(re.match(r"^(\d+\s*[-.]|S\d+E)", file_stem, re.IGNORECASE))
+    has_no_folder_context = item_name == file_stem or item_name == short_name or item_name == item.get("hash")
+    if is_episode_only and has_no_folder_context:
+        diag(f"  SKIPPED (episode-only, no folder context): {short_name}")
+        return None
 
-    item_identity_cache_key = getIdentityCacheKey(type, item.get("hash"), item.get("id"))
-    expects_series_hint = parsed_season is not None or parsed_episode is not None
-    series_identity_cache_keys = []
-    if expects_series_hint:
-        series_identity_cache_keys = getSeriesIdentityCacheKeys(
-            title_data.get("title") or item_name,
-            title_data.get("year"),
-        )
+    # Extract the folder name from the file's path within the torrent.
+    # e.g. "Season 1/Episode 01.mkv" -> "Season 1"
+    file_path = file.get("name") or ""
+    folder_name = os.path.dirname(file_path) if "/" in file_path or "\\" in file_path else ""
+
+    # Skip files inside non-episode subfolders (extras, specials, OPs, EDs, etc.)
+    SKIP_SUBFOLDERS = {"extras", "specials", "op", "ed", "ncop", "nced"}
+    if folder_name:
+        path_parts = folder_name.replace("\\", "/").split("/")
+        if any(part.strip().lower() in SKIP_SUBFOLDERS for part in path_parts):
+            diag(f"  SKIPPED (non-episode subfolder '{folder_name}'): {short_name}")
+            return None
 
     cache_key = getMetadataCacheKey(type, item, file) if SCAN_METADATA else None
     metadata, _, _ = searchMetadata(
@@ -414,16 +197,12 @@ def process_file(item, file, type):
         f"{item_name} {short_name}",
         item.get("hash"),
         item_name,
+        folder_name=folder_name,
         cache_key=cache_key,
-        parsed_season=parsed_season,
-        parsed_episode=parsed_episode,
-        is_special_request=is_special_request,
-        item_identity_cache_key=item_identity_cache_key,
-        series_identity_cache_keys=series_identity_cache_keys,
     )
     data.update(metadata)
     logging.debug(data)
-    insertData(data, type.value)
+    upsertData(data, type.value, ["stable_key"])
     return data
 
 def getUserDownloads(type: DownloadType):
@@ -503,20 +282,258 @@ def getUserDownloads(type: DownloadType):
 
     return files, True, f"{type.value.capitalize()} fetched successfully."
 
-def searchMetadata(
-    query: str,
-    title_data: dict,
-    file_name: str,
-    full_title: str,
-    hash: str,
-    item_name: str,
-    cache_key: str | None = None,
-    parsed_season: int | None = None,
-    parsed_episode: int | None = None,
-    is_special_request: bool = False,
-    item_identity_cache_key: str | None = None,
-    series_identity_cache_keys: list[str] | None = None,
-):
+def searchTMDB(title: str, title_data: dict, file_name: str, item_name: str = "", folder_name: str = ""):
+    """
+    Searches TMDB for metadata, scores results, and returns the best match
+    if it exceeds the confidence threshold. Returns None if no good match.
+    """
+    if not TMDB_API_KEY:
+        return None
+
+    parsed_year = cleanYear(title_data.get("year"))
+    parsed_season = title_data.get("season")
+    parsed_episode = title_data.get("episode")
+    ptn_season = parsed_season
+    ptn_episode = parsed_episode
+
+    # Authoritative season+episode patterns that OVERRIDE PTN's parsing when
+    # matched against the file name. PTN can misidentify episode numbers from
+    # CRC32 hashes in brackets (e.g. "[E896C4BE]" → episode 896) or fail to
+    # recognize anime-style "2nd Season - 05" / "S3 - 08" numbering entirely.
+    auth_se_patterns = (
+        # "S3 - 08" / "S03 - 08"
+        re.compile(r"\bS(\d{1,2})\s*-\s*(\d{1,4})\b", re.IGNORECASE),
+        # "Season 3 - 08"
+        re.compile(r"\bSeason\s+(\d+)\s*-\s*(\d{1,4})\b", re.IGNORECASE),
+        # "2nd Season - 05" / "3rd Season - 12"
+        re.compile(r"\b(\d+)(?:st|nd|rd|th)\s+Season\s*-\s*(\d{1,4})\b", re.IGNORECASE),
+    )
+    override_match_text = None
+    for _pattern in auth_se_patterns:
+        _m = _pattern.search(file_name or "")
+        if _m:
+            override_season = int(_m.group(1))
+            override_episode = int(_m.group(2))
+            if override_season != parsed_season or override_episode != parsed_episode:
+                override_match_text = _m.group(0)
+            parsed_season = override_season
+            parsed_episode = override_episode
+            break
+
+    # Extract season/episode from full-word patterns when PTN missed them.
+    # Priority: file name > folder/search title > torrent name
+    # Separator class covers torrent-naming delimiters like "Season-25",
+    # "Season #25", "Season.25" — not just whitespace.
+    _SEP = r"[\s\-#._:\(\)\[\]]{0,5}"
+    season_re = re.compile(rf"\bSeason{_SEP}(\d+)", re.IGNORECASE)
+    # Ordinal-prefixed season, e.g. "2nd Season", "1st.Season", "3rd-Season"
+    ordinal_season_re = re.compile(rf"\b(\d+)(?:st|nd|rd|th){_SEP}Season\b", re.IGNORECASE)
+    episode_re = re.compile(rf"\bEpisode{_SEP}(\d+)", re.IGNORECASE)
+    s_ep_re = re.compile(r"\bS(\d+)E", re.IGNORECASE)
+    s_standalone_re = re.compile(r"\bS(\d+)\b", re.IGNORECASE)  # [S01], S02, etc.
+
+    sources = (file_name, title, folder_name, item_name)
+
+    if parsed_season is None:
+        for source in sources:
+            if not source:
+                continue
+            m = (
+                season_re.search(source)
+                or ordinal_season_re.search(source)
+                or s_ep_re.search(source)
+                or s_standalone_re.search(source)
+            )
+            if m:
+                parsed_season = int(m.group(1))
+                break
+
+    e_from_s_ep_re = re.compile(r"\bS\d+E(\d+)", re.IGNORECASE)
+
+    if parsed_episode is None:
+        for source in sources:
+            if not source:
+                continue
+            m = episode_re.search(source) or e_from_s_ep_re.search(source)
+            if m:
+                parsed_episode = int(m.group(1))
+                break
+
+    # Detect TV indicator from any source
+    tv_indicator_re = re.compile(
+        r"\bS\d+E"                            # S01E04, S01EXA
+        r"|\bS\d+\b"                          # S01, [S01] (standalone season)
+        rf"|\bSeason{_SEP}\d+"                # Season 03, Season-25, Season #25
+        rf"|\b\d+(?:st|nd|rd|th){_SEP}Season\b"  # 2nd Season, 1st.Season
+        rf"|\bEpisode{_SEP}\d+"               # Episode 039, Episode-7
+        rf"|\bPart{_SEP}\d+",                 # Part 04, Part-2
+        re.IGNORECASE,
+    )
+    has_season_tag = any(tv_indicator_re.search(s) for s in sources if s)
+    is_tv = parsed_season is not None or parsed_episode is not None or has_season_tag
+    extension = os.path.splitext(file_name)[-1]
+
+    # Search order: TV first if season/episode detected, else movie first
+    search_order = [("tv", "tv"), ("movie", "movie")] if is_tv else [("movie", "movie"), ("tv", "tv")]
+
+    best_result = None
+    best_score = -1
+    best_media_type = None
+    best_breakdown = None
+    all_scored: list[dict] = []
+
+    normalised_input = normaliseTitle(title)
+
+    # Use normalised title as the TMDB query — strips Cyrillic, diacritics,
+    # season/episode tags, etc. so the API gets a clean English search term.
+    search_query = normalised_input
+    if not search_query:
+        return None
+
+    # Build a list of queries to try: original, then without trailing roman numerals
+    search_queries = [search_query]
+    stripped = re.sub(r"\s+(?:i{1,3}|iv|v(?:i{0,3})|ix|x(?:i{0,3}))$", "", search_query, flags=re.IGNORECASE)
+    if stripped and stripped != search_query:
+        search_queries.append(stripped)
+
+    TITLE_DETAIL_THRESHOLD = 90  # partial_ratio >= this triggers a detail fetch
+
+    for current_query in search_queries:
+        if best_score >= TMDB_SCORE_THRESHOLD:
+            break
+
+        for search_type, media_type in search_order:
+            # Yearless search to get the broadest candidate pool
+            base_params = {"api_key": TMDB_API_KEY, "query": current_query}
+            try:
+                response = requestWrapper(tmdb_http_client, "GET", f"/search/{search_type}", params=base_params)
+            except Exception as e:
+                logging.warning(f"TMDB search error for '{current_query}' ({search_type}): {e}")
+                continue
+
+            if response.status_code != 200:
+                logging.warning(f"TMDB search returned {response.status_code} for '{current_query}' ({search_type})")
+                continue
+
+            candidates = response.json().get("results", [])[:5]
+
+            # For candidates with strong title matches, fetch detail to get
+            # the full airing range (first_air_date → last_air_date for TV).
+            # This lets the scorer check if the parsed year falls within the
+            # show's run rather than only matching the first air date.
+            if parsed_year and candidates:
+                for candidate in candidates:
+                    candidate_title = candidate.get("title") or candidate.get("name") or ""
+                    partial = fuzz.partial_ratio(normalised_input, normaliseTitle(candidate_title))
+                    if partial >= TITLE_DETAIL_THRESHOLD and media_type == "tv":
+                        tmdb_id = candidate.get("id")
+                        try:
+                            detail_resp = requestWrapper(tmdb_http_client, "GET", f"/tv/{tmdb_id}", params={"api_key": TMDB_API_KEY})
+                            if detail_resp.status_code == 200:
+                                detail = detail_resp.json()
+                                candidate["last_air_date"] = detail.get("last_air_date")
+                                candidate["seasons"] = detail.get("seasons", [])
+                        except Exception as e:
+                            logging.debug(f"TMDB detail fetch failed for tv/{tmdb_id}: {e}")
+
+            for result in candidates:
+                score, breakdown = scoreTmdbResult(title, parsed_year, parsed_season, parsed_episode, result, media_type)
+                all_scored.append(breakdown)
+                if score > best_score:
+                    best_score = score
+                    best_result = result
+                    best_media_type = media_type
+                    best_breakdown = breakdown
+
+            # If we already found a confident match, skip the other type
+            if best_score >= TMDB_SCORE_THRESHOLD:
+                break
+
+    # --- Diagnostic output ---
+    diag_lines = [
+        "",
+        f"  TMDB DIAGNOSTICS for file: {file_name}",
+        f"  Folder name: {folder_name or '(none)'}",
+        f"  Torrent name: {item_name or '(none)'}",
+        f"  Search title: {title}",
+        f"  Normalised input: '{normalised_input}'",
+        f"  PTN parsed -> year={parsed_year}  season={parsed_season}  episode={parsed_episode}  is_tv={is_tv}"
+        + (f"  [override: PTN had season={ptn_season} episode={ptn_episode}, matched '{override_match_text}' in file name]" if override_match_text else ""),
+        f"  Threshold: {TMDB_SCORE_THRESHOLD}   Candidates scored: {len(all_scored)}",
+        "  " + "-" * 130,
+        f"  {'#':<3} {'Score':<7} {'Title':<7} {'Part':<6} {'Exact':<6} {'Year':<6} {'Type':<6} {'Seas':<6} {'TMDB Title':<35} {'Normalised TMDB':<30} {'Airing':<12} {'Type':<6} {'ID':<10}",
+        "  " + "-" * 130,
+    ]
+    for i, bd in enumerate(sorted(all_scored, key=lambda x: x["total"], reverse=True)):
+        marker = " <-- BEST" if bd is best_breakdown else ""
+        tied = " [TIED]" if bd is not best_breakdown and bd["total"] == best_score else ""
+        yr_start = bd.get("tmdb_year") or "-"
+        yr_end = bd.get("tmdb_year_end")
+        airing = f"{yr_start}-{yr_end}" if yr_end and yr_end != yr_start else str(yr_start)
+        diag_lines.append(
+            f"  {i+1:<3} {bd['total']:<7} {bd['title_score']:<7} {bd.get('title_partial', '-'):<6} {bd.get('title_exact', '-'):<6} "
+            f"{bd['year_score']:<6} {bd['type_score']:<6} {bd['season_score']:<6} "
+            f"{bd['tmdb_title'][:35]:<35} {bd['normalised_tmdb'][:30]:<30} {airing:<12} {bd['media_type']:<6} {bd['tmdb_id']:<10}{marker}{tied}"
+        )
+    diag_lines.append("  " + "-" * 130)
+
+    # Accept if score meets threshold, or if there's only 1 result and score >= 50
+    SINGLE_RESULT_THRESHOLD = 50
+    is_single_result = len(all_scored) == 1
+    accepted = best_result is not None and (
+        best_score >= TMDB_SCORE_THRESHOLD
+        or (is_single_result and best_score >= SINGLE_RESULT_THRESHOLD)
+    )
+
+    if not accepted:
+        diag_lines.append(f"  RESULT: NO MATCH (best score {best_score} < threshold {TMDB_SCORE_THRESHOLD})")
+        diag("\n".join(diag_lines))
+        return None
+
+    if is_single_result and best_score < TMDB_SCORE_THRESHOLD:
+        diag_lines.append(f"  RESULT: ACCEPTED (single result) '{best_breakdown['tmdb_title']}' (score {best_score} >= single-result threshold {SINGLE_RESULT_THRESHOLD})")
+    else:
+        diag_lines.append(f"  RESULT: ACCEPTED '{best_breakdown['tmdb_title']}' (score {best_score} >= threshold {TMDB_SCORE_THRESHOLD})")
+    diag("\n".join(diag_lines))
+
+    # Build metadata dict
+    tmdb_title = cleanTitle(best_result.get("title") or best_result.get("name") or title)
+    date_str = best_result.get("release_date") or best_result.get("first_air_date") or ""
+    tmdb_year = None
+    if date_str:
+        try:
+            tmdb_year = int(date_str[:4])
+        except (ValueError, IndexError):
+            pass
+
+    poster = best_result.get("poster_path")
+    backdrop = best_result.get("backdrop_path")
+
+    metadata = {
+        "metadata_title": tmdb_title,
+        "metadata_link": f"https://www.themoviedb.org/{best_media_type}/{best_result.get('id')}",
+        "metadata_mediatype": "series" if best_media_type == "tv" else "movie",
+        "metadata_image": f"https://image.tmdb.org/t/p/w500{poster}" if poster else None,
+        "metadata_backdrop": f"https://image.tmdb.org/t/p/w1280{backdrop}" if backdrop else None,
+        "metadata_years": tmdb_year,
+        "metadata_season": parsed_season,
+        "metadata_episode": parsed_episode,
+        "metadata_filename": file_name,
+        "metadata_rootfoldername": f"{tmdb_title} ({tmdb_year})" if tmdb_year else tmdb_title,
+        "metadata_tmdb_score": best_score,
+    }
+
+    if best_media_type == "tv":
+        series_season_episode = constructSeriesTitle(season=parsed_season, episode=parsed_episode)
+        if series_season_episode:
+            metadata["metadata_filename"] = f"{tmdb_title} {series_season_episode}{extension}"
+        metadata["metadata_foldername"] = constructSeriesTitle(season=parsed_season, folder=True)
+    elif best_media_type == "movie" and tmdb_year:
+        metadata["metadata_filename"] = f"{tmdb_title} ({tmdb_year}){extension}"
+
+    return metadata
+
+def searchMetadata(query: str, title_data: dict, file_name: str, full_title: str, hash: str, item_name: str, folder_name: str = "", cache_key: str | None = None):
     base_metadata = {
         "metadata_title": cleanTitle(query),
         "metadata_link": None,
@@ -527,8 +544,7 @@ def searchMetadata(
         "metadata_season": None,
         "metadata_episode": None,
         "metadata_filename": file_name,
-        "metadata_rootfoldername": cleanTitle(item_name) if item_name else title_data.get("item_name", None),
-        "metadata_foldername": None,
+        "metadata_rootfoldername": title_data.get("item_name", None),
     }
 
     def cacheAndReturn(metadata: dict, success: bool, detail: str):
@@ -537,6 +553,7 @@ def searchMetadata(
         return metadata, success, detail
 
     if not SCAN_METADATA:
+        base_metadata["metadata_rootfoldername"] = item_name
         return base_metadata, False, "Metadata scanning is disabled."
 
     if cache_key is not None:
@@ -546,29 +563,76 @@ def searchMetadata(
             logging.debug(f"Metadata cache hit for key {cache_key}")
             return cached_metadata, cached_success, f"Metadata cache hit. {cached_detail}"
 
+    # Try TMDB — torrent/folder name first, file name only as fallback.
+    folder_title_data = PTN.parse(item_name) if item_name else {}
+    folder_query = folder_title_data.get("title", item_name) or query
+    file_query = title_data.get("title", "")
+
+    # Merge: file is authoritative for season/episode (specific to the file),
+    # folder is authoritative for year (often more accurate in torrent names).
+    folder_merged_data = {**title_data}
+    if folder_title_data.get("year") is not None:
+        folder_merged_data["year"] = folder_title_data["year"]
+    # Keep season/episode from file parse (title_data) — folder often has
+    # a range like [1,2,3,...8] which is the whole series, not the specific episode.
+
+    # 1. Search with torrent/folder name first
+    tmdb_result = searchTMDB(folder_query, folder_merged_data, file_name, item_name=item_name, folder_name=folder_name)
+    if tmdb_result is not None:
+        base_metadata.update(tmdb_result)
+        return cacheAndReturn(base_metadata, True, f"TMDB match via torrent name (score: {tmdb_result.get('metadata_tmdb_score')}). Searching for {folder_query}, item hash: {hash}")
+
+    # 2. Try subfolder name (last path component of folder_name).
+    #    e.g. "Total Drama Complete (...)/Total Drama Presents The Ridonculous Race" -> last part
+    subfolder_query = ""
+    if folder_name:
+        last_part = folder_name.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        subfolder_title_data = PTN.parse(last_part) if last_part else {}
+        subfolder_query = subfolder_title_data.get("title", last_part) or ""
+    normalised_subfolder = normaliseTitle(subfolder_query) if subfolder_query else ""
+    normalised_folder = normaliseTitle(folder_query)
+
+    if (subfolder_query and normalised_subfolder
+            and normalised_subfolder != normalised_folder):
+        diag(f"  >> Retrying TMDB with subfolder name: '{subfolder_query}' (normalised: '{normalised_subfolder}')")
+        subfolder_merged_data = {**title_data}
+        if subfolder_title_data.get("year") is not None:
+            subfolder_merged_data["year"] = subfolder_title_data["year"]
+        tmdb_result = searchTMDB(subfolder_query, subfolder_merged_data, file_name, item_name=item_name, folder_name=folder_name)
+        if tmdb_result is not None:
+            base_metadata.update(tmdb_result)
+            return cacheAndReturn(base_metadata, True, f"TMDB match via subfolder name (score: {tmdb_result.get('metadata_tmdb_score')}). Searching for {subfolder_query}, item hash: {hash}")
+
+    # 3. Fall back to file name only if torrent and subfolder searches failed, and:
+    #    - file title differs from folder title (and subfolder title)
+    #    - filename doesn't start with S##E## (PTN "title" would be episode title)
+    #    - normalised file title isn't purely numeric (e.g. "304" from "3x04")
+    normalised_file_query = normaliseTitle(file_query) if file_query else ""
+    starts_with_episode_tag = bool(re.match(r"^S\d+E\d+", file_name, re.IGNORECASE))
+    is_numeric_only = bool(normalised_file_query and re.match(r"^\d+$", normalised_file_query))
+    already_tried = normalised_file_query in (normalised_folder, normalised_subfolder)
+    if (file_query and not starts_with_episode_tag and not is_numeric_only
+            and not already_tried):
+        diag(f"  >> Retrying TMDB with file name: '{file_query}' (normalised: '{normalised_file_query}')")
+        tmdb_result = searchTMDB(file_query, title_data, file_name, item_name=item_name, folder_name=folder_name)
+        if tmdb_result is not None:
+            base_metadata.update(tmdb_result)
+            return cacheAndReturn(base_metadata, True, f"TMDB match via file name (score: {tmdb_result.get('metadata_tmdb_score')}). Searching for {file_query}, item hash: {hash}")
+    else:
+        skip_reasons = []
+        if not file_query:
+            skip_reasons.append("no file title")
+        if starts_with_episode_tag:
+            skip_reasons.append("filename starts with S##E##")
+        if is_numeric_only:
+            skip_reasons.append("normalised file title is numeric-only")
+        if already_tried:
+            skip_reasons.append(f"same as already-tried query ('{normalised_file_query}')")
+        diag(f"  >> File fallback SKIPPED: {', '.join(skip_reasons) or 'unknown'}")
+
+    # Fall back to TorBox Search API
+    diag(f"  >> Falling back to TorBox Search API for: {file_name}")
     extension = os.path.splitext(file_name)[-1]
-
-    identity_cache_keys = []
-    if item_identity_cache_key is not None:
-        identity_cache_keys.append(item_identity_cache_key)
-    if series_identity_cache_keys:
-        identity_cache_keys.extend(series_identity_cache_keys)
-
-    for identity_cache_key in identity_cache_keys:
-        cached_identity = getCachedIdentity(identity_cache_key)
-        if cached_identity is None:
-            continue
-
-        metadata_from_identity = buildMetadataFromIdentity(
-            cached_identity,
-            base_metadata=base_metadata,
-            extension=extension,
-            parsed_season=parsed_season,
-            parsed_episode=parsed_episode,
-            is_special_request=is_special_request,
-        )
-        return cacheAndReturn(metadata_from_identity, True, f"Metadata identity cache hit for key {identity_cache_key}")
-
     try:
         response = requestWrapper(search_api_http_client, "GET", f"/meta/search/{full_title}", params={"type": "file"})
     except Exception as e:
@@ -578,63 +642,31 @@ def searchMetadata(
         logging.error(f"Error searching metadata: {response.status_code}. {response.text}")
         return cacheAndReturn(base_metadata, False, f"Error searching metadata. {response.status_code}. Searching for {query}, item hash: {hash}")
     try:
-        metadata_results = response.json().get("data", [])
-        if not metadata_results:
+        data = response.json().get("data", [])[0]
+
+        title = cleanTitle(data.get("title"))
+        base_metadata["metadata_title"] = title
+        base_metadata["metadata_years"] = cleanYear(title_data.get("year", None) or data.get("releaseYears", None))
+
+        if data.get("type") == "anime" or data.get("type") == "series":
+            series_season_episode = constructSeriesTitle(season=title_data.get("season", None), episode=title_data.get("episode", None))
+            file_name = f"{title} {series_season_episode}{extension}"
+            base_metadata["metadata_foldername"] = constructSeriesTitle(season=title_data.get("season"), folder=True)
+            base_metadata["metadata_season"] = title_data.get("season")
+            base_metadata["metadata_episode"] = title_data.get("episode")
+        elif data.get("type") == "movie":
+            file_name = f"{title} ({base_metadata['metadata_years']}){extension}"
+        else:
             return cacheAndReturn(base_metadata, False, f"No metadata found. Searching for {query}, item hash: {hash}")
 
-        normalized_query = normalizeTitle(query) or normalizeTitle(item_name) or normalizeTitle(full_title)
-        query_year = cleanYear(title_data.get("year"))
-        expects_series = parsed_season is not None or parsed_episode is not None
+        base_metadata["metadata_filename"] = file_name
+        base_metadata["metadata_mediatype"] = data.get("type")
+        base_metadata["metadata_link"] = data.get("link")
+        base_metadata["metadata_image"] = data.get("image")
+        base_metadata["metadata_backdrop"] = data.get("backdrop")
+        base_metadata["metadata_rootfoldername"] = f"{title} ({base_metadata['metadata_years']})"
 
-        selected_candidate, selected_score = selectBestMetadataCandidate(
-            metadata_results,
-            normalized_query=normalized_query,
-            query_year=query_year,
-            expects_series=expects_series,
-            is_special_request=is_special_request,
-        )
-
-        if selected_candidate is None or selected_score < METADATA_MIN_SCORE:
-            return cacheAndReturn(
-                base_metadata,
-                False,
-                f"No confident metadata found. Best score {selected_score:.2f}. Searching for {query}, item hash: {hash}",
-            )
-
-        if expects_series and selected_candidate.get("type") not in ("series", "anime"):
-            return cacheAndReturn(
-                base_metadata,
-                False,
-                f"Series metadata could not be confidently matched. Best type: {selected_candidate.get('type')}. Searching for {query}, item hash: {hash}",
-            )
-
-        identity_metadata = buildIdentityMetadata(
-            selected_candidate,
-            title_data=title_data,
-            item_name=item_name,
-        )
-
-        metadata = buildMetadataFromIdentity(
-            identity_metadata,
-            base_metadata=base_metadata,
-            extension=extension,
-            parsed_season=parsed_season,
-            parsed_episode=parsed_episode,
-            is_special_request=is_special_request,
-        )
-
-        if item_identity_cache_key is not None:
-            setCachedMetadata(item_identity_cache_key, identity_metadata, True, "Item metadata identity cached.")
-
-        if series_identity_cache_keys and identity_metadata.get("metadata_mediatype") in ("series", "anime"):
-            for identity_cache_key in set(series_identity_cache_keys):
-                setCachedMetadata(identity_cache_key, identity_metadata, True, "Series metadata identity cached.")
-
-        return cacheAndReturn(
-            metadata,
-            True,
-            f"Metadata found with score {selected_score:.2f}. Searching for {query}, item hash: {hash}",
-        )
+        return cacheAndReturn(base_metadata, True, f"Metadata found. Searching for {query}, item hash: {hash}")
     except IndexError:
         return cacheAndReturn(base_metadata, False, f"No metadata found. Searching for {query}, item hash: {hash}")
     except httpx.TimeoutException:

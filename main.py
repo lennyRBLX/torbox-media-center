@@ -86,8 +86,5 @@ if __name__ == "__main__":
         if mount_method == "fuse":
             from functions.fuseFilesystemFunctions import unmountFuse
             unmountFuse()
-        elif mount_method == "strm":
-            from functions.stremFilesystemFunctions import unmountStrm
-            unmountStrm()
         closeAllDatabases()
         exit(0)

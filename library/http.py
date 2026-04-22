@@ -50,6 +50,18 @@ search_api_http_client = httpx.Client(
     transport=transport,
 )
 
+tmdb_transport = httpx.HTTPTransport(retries=3)
+
+tmdb_http_client = httpx.Client(
+    base_url="https://api.themoviedb.org/3",
+    headers={
+        "User-Agent": USER_AGENT,
+    },
+    timeout=httpx.Timeout(10),
+    follow_redirects=True,
+    transport=tmdb_transport,
+)
+
 general_http_client = httpx.Client(
     headers={
         "Authorization": f"Bearer {TORBOX_API_KEY}",

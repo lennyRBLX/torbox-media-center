@@ -1,4 +1,4 @@
-from tinydb import TinyDB
+from tinydb import TinyDB, Query
 import threading
 import logging
 
@@ -83,6 +83,41 @@ def getAllData(type: str):
             return data, True, "Data retrieved successfully."
         except Exception as e:
             return None, False, f"Error retrieving data. {e}"
+
+def upsertData(data: dict, type: str, key_fields: list[str]):
+    db = getDatabase(type)
+    db_lock = getDatabaseLock(type)
+
+    if db is None or db_lock is None:
+        return False, "Database connection failed."
+
+    query = Query()
+    condition = None
+    for field in key_fields:
+        clause = query[field] == data[field]
+        condition = clause if condition is None else (condition & clause)
+
+    with db_lock:
+        try:
+            db.upsert(data, condition)
+            return True, "Data upserted successfully."
+        except Exception as e:
+            return False, f"Error upserting data: {e}"
+
+def removeStaleData(type: str, valid_keys: set, key_field: str):
+    db = getDatabase(type)
+    db_lock = getDatabaseLock(type)
+
+    if db is None or db_lock is None:
+        return False, "Database connection failed."
+
+    query = Query()
+    with db_lock:
+        try:
+            db.remove(~query[key_field].test(lambda v: v in valid_keys))
+            return True, "Stale data removed."
+        except Exception as e:
+            return False, f"Error removing stale data: {e}"
 
 def closeDatabase(name: str = "db"):
     """

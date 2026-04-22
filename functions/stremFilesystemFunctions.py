@@ -31,7 +31,7 @@ def generateFolderPath(data: dict) -> str | None:
             return None
 
         if media_type == "series" or media_type == "anime":
-            if not metadata_foldername:
+            if not metadata_foldername or data.get("metadata_episode") is None:
                 return None
             return os.path.join(
                 root_folder,
@@ -74,6 +74,11 @@ def generateStremFile(file_path: str, url: str, type: str, file_name: str, downl
 
 def runStrm():
     all_downloads = getAllUserDownloads()
+
+    if not all_downloads:
+        logging.info("No downloads found in database. Skipping strm sync to avoid deleting existing files.")
+        return
+
     # Get all existing .strm files
     existing_strm_files = set(glob.glob(os.path.join(MOUNT_PATH, "**", "*.strm"), recursive=True))
 
@@ -108,22 +113,3 @@ def runStrm():
 
     logging.debug(f"Updated {len(all_downloads)} strm files.")
 
-def unmountStrm():
-    """
-    Deletes all strm files and any subfolders in the mount path for cleaning up.
-    """
-    folders = [
-        MOUNT_PATH,
-        os.path.join(MOUNT_PATH, "movies"),
-        os.path.join(MOUNT_PATH, "series"),
-    ]
-    for folder in folders:
-        if os.path.exists(folder):
-            logging.debug(f"Folder {folder} already exists. Deleting...")
-            for item in os.listdir(folder):
-                item_path = os.path.join(folder, item)
-                if os.path.isdir(item_path):
-                    import shutil
-                    shutil.rmtree(item_path)
-                else:
-                    os.remove(item_path)

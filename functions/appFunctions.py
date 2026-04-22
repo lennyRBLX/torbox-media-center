@@ -1,12 +1,11 @@
 from library.app import RAW_MODE
-from functions.torboxFunctions import getUserDownloads, DownloadType
+from functions.torboxFunctions import getUserDownloads, DownloadType, _reset_diag_log
 from library.filesystem import MOUNT_METHOD, MOUNT_PATH
 from library.app import MOUNT_REFRESH_TIME
 from library.torbox import TORBOX_API_KEY
-from functions.databaseFunctions import getAllData, clearDatabase
+from functions.databaseFunctions import getAllData, removeStaleData
 import logging
 import os
-import shutil
 import threading
 from library.app import getCurrentVersion
 import git
@@ -21,27 +20,13 @@ def initializeFolders():
             os.path.join(MOUNT_PATH, "series"),
         ])
     for folder in folders:
-        if os.path.exists(folder):
-            logging.debug(f"Folder {folder} already exists. Deleting...")
-            for item in os.listdir(folder):
-                item_path = os.path.join(folder, item)
-                if os.path.isdir(item_path):
-                    shutil.rmtree(item_path)
-                else:
-                    os.remove(item_path)
-        else:
-            logging.debug(f"Creating folder {folder}...")
-            os.makedirs(folder, exist_ok=True)
+        os.makedirs(folder, exist_ok=True)
 
 def getAllUserDownloadsFresh():
+    _reset_diag_log()
     all_downloads = []
     logging.info("Fetching all user downloads...")
     for download_type in DownloadType:
-        logging.debug(f"Clearing database for {download_type.value}...")
-        success, detail = clearDatabase(download_type.value)
-        if not success:
-            logging.error(f"Error clearing {download_type.value} database: {detail}")
-            continue
         logging.debug(f"Fetching {download_type.value} downloads...")
         downloads, success, detail = getUserDownloads(download_type)
         if not success:
@@ -50,6 +35,10 @@ def getAllUserDownloadsFresh():
         if not downloads:
             logging.info(f"No {download_type.value} downloads found.")
             continue
+        valid_keys = {d["stable_key"] for d in downloads if d and "stable_key" in d}
+        stale_success, stale_detail = removeStaleData(download_type.value, valid_keys, "stable_key")
+        if not stale_success:
+            logging.error(f"Error removing stale {download_type.value} data: {stale_detail}")
         all_downloads.extend(downloads)
         logging.debug(f"Fetched {len(downloads)} {download_type.value} downloads.")
     return all_downloads
