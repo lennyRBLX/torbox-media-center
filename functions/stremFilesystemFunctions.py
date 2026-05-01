@@ -1,9 +1,13 @@
 import os
 import glob
 import logging
+import threading
 from library.app import RAW_MODE
 from library.filesystem import MOUNT_PATH
 from functions.appFunctions import getAllUserDownloads
+
+_runStrm_lock = threading.Lock()
+
 
 def getMountCategory(media_type: str | None):
     if media_type == "movie":
@@ -11,6 +15,7 @@ def getMountCategory(media_type: str | None):
     if media_type == "series" or media_type == "anime":
         return "series"
     return None
+
 
 def generateFolderPath(data: dict) -> str | None:
     """
@@ -43,73 +48,99 @@ def generateFolderPath(data: dict) -> str | None:
 
         return None
 
-def generateStremFile(file_path: str, url: str, type: str, file_name: str, download=None):
-    if RAW_MODE:
-        if download is None:
-            return False
-        original_path = download.get("path")
-        if not original_path:
-            return False
-        full_path = os.path.join(MOUNT_PATH, os.path.dirname(original_path))
-    else:
-        mount_category = getMountCategory(type)
-        if mount_category is None:
-            return False
-        full_path = os.path.join(MOUNT_PATH, mount_category, file_path)
+
+def writeStremFile(strm_path: str, urls: list[str]) -> bool:
+    if not urls:
+        return False
+    content = "\n".join(urls)
     try:
-        os.makedirs(full_path, exist_ok=True)
-        with open(f"{full_path}/{file_name}.strm", "w") as file:
-            file.write(url)
-        logging.debug(f"Created strm file: {full_path}/{file_name}.strm")
+        os.makedirs(os.path.dirname(strm_path), exist_ok=True)
+        if os.path.exists(strm_path):
+            try:
+                with open(strm_path, "r") as existing:
+                    if existing.read() == content:
+                        return True
+            except OSError:
+                pass
+        with open(strm_path, "w") as file:
+            file.write(content)
+        logging.debug(
+            f"Wrote strm file ({len(urls)} url{'s' if len(urls) != 1 else ''}): {strm_path}"
+        )
         return True
     except FileNotFoundError as e:
-        logging.error(f"Error creating strm file (likely bad naming scheme of file): {e}")
+        logging.error(
+            f"Error creating strm file (likely bad naming scheme of file): {e}"
+        )
         return False
     except OSError as e:
-        logging.error(f"Error creating strm file (likely bad or missing permissions): {e}")
+        logging.error(
+            f"Error creating strm file (likely bad or missing permissions): {e}"
+        )
         return False
     except Exception as e:
         logging.error(f"Error creating strm file: {e}")
         return False
 
+
 def runStrm():
-    all_downloads = getAllUserDownloads()
-
-    if not all_downloads:
-        logging.info("No downloads found in database. Skipping strm sync to avoid deleting existing files.")
+    if not _runStrm_lock.acquire(blocking=False):
+        logging.info("Skipping runStrm because another run is already in progress.")
         return
+    try:
+        all_downloads = getAllUserDownloads()
 
-    # Get all existing .strm files
-    existing_strm_files = set(glob.glob(os.path.join(MOUNT_PATH, "**", "*.strm"), recursive=True))
+        if not all_downloads:
+            logging.info(
+                "No downloads found in database. Skipping strm sync to avoid deleting existing files."
+            )
+            return
 
-    new_strm_files = set()
-    for download in all_downloads:
-        file_path = generateFolderPath(download)
-        if file_path is None:
-            continue
-        if RAW_MODE:
-            strm_path = os.path.join(MOUNT_PATH, file_path, f"{download.get('metadata_filename')}.strm")
-        else:
-            mount_category = getMountCategory(download.get("metadata_mediatype"))
-            if mount_category is None:
+        # Get all existing .strm files
+        existing_strm_files = set(
+            glob.glob(os.path.join(MOUNT_PATH, "**", "*.strm"), recursive=True)
+        )
+
+        path_to_urls: dict[str, list[str]] = {}
+        for download in all_downloads:
+            url = download.get("download_link")
+            file_name = download.get("metadata_filename")
+            if not url or not file_name:
                 continue
-            strm_path = os.path.join(MOUNT_PATH, mount_category, file_path, f"{download.get('metadata_filename')}.strm")
-        new_strm_files.add(strm_path)
-        generateStremFile(file_path, download.get("download_link"), download.get("metadata_mediatype"), download.get("metadata_filename"), download)
+            file_path = generateFolderPath(download)
+            if file_path is None:
+                continue
+            if RAW_MODE:
+                strm_path = os.path.join(MOUNT_PATH, file_path, f"{file_name}.strm")
+            else:
+                mount_category = getMountCategory(download.get("metadata_mediatype"))
+                if mount_category is None:
+                    continue
+                strm_path = os.path.join(
+                    MOUNT_PATH, mount_category, file_path, f"{file_name}.strm"
+                )
+            urls = path_to_urls.setdefault(strm_path, [])
+            if url not in urls:
+                urls.append(url)
 
-    # Remove .strm files for deleted downloads
-    for strm_file in existing_strm_files:
-        if strm_file not in new_strm_files:
-            try:
-                os.remove(strm_file)
-                logging.debug(f"Removed stale .strm file: {strm_file}")
-                # Remove empty directories
-                dir = os.path.dirname(strm_file)
-                while dir != MOUNT_PATH and not os.listdir(dir):
-                    os.rmdir(dir)
-                    dir = os.path.dirname(dir)
-            except Exception as e:
-                logging.error(f"Error removing .strm file: {e}")
+        new_strm_files = set(path_to_urls.keys())
+        for strm_path, urls in path_to_urls.items():
+            writeStremFile(strm_path, urls)
 
-    logging.debug(f"Updated {len(all_downloads)} strm files.")
+        # Remove .strm files for deleted downloads
+        for strm_file in existing_strm_files:
+            if strm_file not in new_strm_files:
+                try:
+                    os.remove(strm_file)
+                    logging.debug(f"Removed stale .strm file: {strm_file}")
+                    # Remove empty directories
+                    dir = os.path.dirname(strm_file)
+                    while dir != MOUNT_PATH and not os.listdir(dir):
+                        os.rmdir(dir)
+                        dir = os.path.dirname(dir)
+                except Exception as e:
+                    logging.error(f"Error removing .strm file: {e}")
 
+        logging.debug(f"Updated {len(all_downloads)} strm files.")
+    finally:
+        _runStrm_lock.release()

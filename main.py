@@ -64,6 +64,9 @@ if __name__ == "__main__":
             "trigger": "scheduled",
         },
         id="get_all_user_downloads_fresh",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=30,
     )
 
     try:
@@ -76,6 +79,9 @@ if __name__ == "__main__":
                 "interval",
                 minutes=5,
                 id="run_strm",
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=30,
             )
             scheduler.start()
         elif mount_method == "fuse":

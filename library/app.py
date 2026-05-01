@@ -7,6 +7,7 @@ load_dotenv()
 SCAN_METADATA = os.getenv("ENABLE_METADATA", "false").lower() == "true"
 RAW_MODE = os.getenv("RAW_MODE", "false").lower() == "true"
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", None)
+TMDB_DIAG_ENABLED = os.getenv("TMDB_DIAG_ENABLED", "false").lower() == "true"
 
 class MountRefreshTimes(Enum):
     # times are shown in hours

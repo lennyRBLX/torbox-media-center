@@ -3,7 +3,7 @@ import httpx
 from enum import Enum
 import PTN
 from library.torbox import TORBOX_API_KEY
-from library.app import SCAN_METADATA, TMDB_API_KEY
+from library.app import SCAN_METADATA, TMDB_API_KEY, TMDB_DIAG_ENABLED
 from functions.mediaFunctions import constructSeriesTitle, cleanTitle, cleanYear, normaliseTitle, scoreTmdbResult, TMDB_SCORE_THRESHOLD
 from rapidfuzz import fuzz
 from functions.databaseFunctions import upsertData, getDatabase, getDatabaseLock
@@ -24,20 +24,45 @@ from datetime import datetime, timezone
 DIAG_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tmdb_diagnostics.log")
 _diag_lock = threading.Lock()
 
+# Per-refresh cache hit/miss counters (reset by _reset_diag_log)
+_cache_hits = 0
+_cache_misses = 0
+_cache_counter_lock = threading.Lock()
+
 
 def _reset_diag_log():
     """Clear the diagnostics log at the start of each refresh cycle."""
+    global _cache_hits, _cache_misses
+    with _cache_counter_lock:
+        _cache_hits = 0
+        _cache_misses = 0
+    if not TMDB_DIAG_ENABLED:
+        return
     with _diag_lock:
         with open(DIAG_LOG_PATH, "w", encoding="utf-8") as f:
             f.write(f"=== TMDB Diagnostics Log — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} ===\n\n")
 
 
 def diag(message: str):
-    """Write a line to both stdout and the diagnostics log file."""
+    """Write a line to stdout and the diagnostics log file. No-op when TMDB_DIAG_ENABLED is false."""
+    if not TMDB_DIAG_ENABLED:
+        return
     print(message)
     with _diag_lock:
         with open(DIAG_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(message + "\n")
+
+
+def _bump_cache_hit():
+    global _cache_hits
+    with _cache_counter_lock:
+        _cache_hits += 1
+
+
+def _bump_cache_miss():
+    global _cache_misses
+    with _cache_counter_lock:
+        _cache_misses += 1
 
 class DownloadType(Enum):
     torrent = "torrents"
@@ -133,14 +158,23 @@ def pruneExpiredMetadataCache():
         if removed:
             logging.info(f"Pruned {len(removed)} expired metadata cache entries.")
 
+SAMPLE_FILE_RE = re.compile(r"(^|[\W_])sample([\W_]|$)", re.IGNORECASE)
+
+
 def process_file(item, file, type):
     """Process a single file and return the processed data"""
     short_name = file.get("short_name") or file.get("name") or str(file.get("id"))
     mimetype = file.get("mimetype")
     item_name = item.get("name")
+    torrent_id = item.get("id")
 
     if not mimetype or not mimetype.startswith("video/") or mimetype not in ACCEPTABLE_MIME_TYPES:
         logging.debug(f"Skipping file {short_name} with mimetype {mimetype}")
+        return None
+
+    file_stem_basename = os.path.splitext(os.path.basename(short_name))[0]
+    if SAMPLE_FILE_RE.search(file_stem_basename):
+        diag(f"  SKIPPED (sample file, torrent_id={torrent_id}): {short_name}")
         return None
 
     data = {
@@ -173,7 +207,7 @@ def process_file(item, file, type):
     is_episode_only = bool(re.match(r"^(\d+\s*[-.]|S\d+E)", file_stem, re.IGNORECASE))
     has_no_folder_context = item_name == file_stem or item_name == short_name or item_name == item.get("hash")
     if is_episode_only and has_no_folder_context:
-        diag(f"  SKIPPED (episode-only, no folder context): {short_name}")
+        diag(f"  SKIPPED (episode-only, no folder context, torrent_id={torrent_id}): {short_name}")
         return None
 
     # Extract the folder name from the file's path within the torrent.
@@ -182,11 +216,11 @@ def process_file(item, file, type):
     folder_name = os.path.dirname(file_path) if "/" in file_path or "\\" in file_path else ""
 
     # Skip files inside non-episode subfolders (extras, specials, OPs, EDs, etc.)
-    SKIP_SUBFOLDERS = {"extras", "specials", "op", "ed", "ncop", "nced"}
+    SKIP_SUBFOLDERS = {"extras", "specials", "op", "ed", "ncop", "nced", "featurettes"}
     if folder_name:
         path_parts = folder_name.replace("\\", "/").split("/")
         if any(part.strip().lower() in SKIP_SUBFOLDERS for part in path_parts):
-            diag(f"  SKIPPED (non-episode subfolder '{folder_name}'): {short_name}")
+            diag(f"  SKIPPED (non-episode subfolder '{folder_name}', torrent_id={torrent_id}): {short_name}")
             return None
 
     cache_key = getMetadataCacheKey(type, item, file) if SCAN_METADATA else None
@@ -199,6 +233,7 @@ def process_file(item, file, type):
         item_name,
         folder_name=folder_name,
         cache_key=cache_key,
+        torrent_id=torrent_id,
     )
     data.update(metadata)
     logging.debug(data)
@@ -280,9 +315,16 @@ def getUserDownloads(type: DownloadType):
                 logging.error(f"Error processing file {file.get('short_name', 'unknown')}: {e}")
                 logging.error(traceback.format_exc())
 
+    if SCAN_METADATA:
+        with _cache_counter_lock:
+            hits, misses = _cache_hits, _cache_misses
+        total = hits + misses
+        hit_pct = (hits * 100 // total) if total else 0
+        logging.info(f"Metadata cache stats after {type.value}: hits={hits} misses={misses} ({hit_pct}% hit rate)")
+
     return files, True, f"{type.value.capitalize()} fetched successfully."
 
-def searchTMDB(title: str, title_data: dict, file_name: str, item_name: str = "", folder_name: str = ""):
+def searchTMDB(title: str, title_data: dict, file_name: str, item_name: str = "", folder_name: str = "", torrent_id=None):
     """
     Searches TMDB for metadata, scores results, and returns the best match
     if it exceeds the confidence threshold. Returns None if no good match.
@@ -358,6 +400,14 @@ def searchTMDB(title: str, title_data: dict, file_name: str, item_name: str = ""
             if m:
                 parsed_episode = int(m.group(1))
                 break
+
+    # Bare-leading-number fallback: "12 - The Message.mkv" style.
+    # Only on file_name, and only when a season was detected elsewhere, to
+    # avoid false positives on ranked movie files like "01 - The Godfather.mkv".
+    if parsed_episode is None and parsed_season is not None and file_name:
+        m = re.match(r"^(\d{1,3})\s*[-.\s_]\s*\D", file_name)
+        if m:
+            parsed_episode = int(m.group(1))
 
     # Detect TV indicator from any source
     tv_indicator_re = re.compile(
@@ -453,6 +503,7 @@ def searchTMDB(title: str, title_data: dict, file_name: str, item_name: str = ""
     diag_lines = [
         "",
         f"  TMDB DIAGNOSTICS for file: {file_name}",
+        f"  Torrent ID: {torrent_id if torrent_id is not None else '(none)'}",
         f"  Folder name: {folder_name or '(none)'}",
         f"  Torrent name: {item_name or '(none)'}",
         f"  Search title: {title}",
@@ -533,7 +584,7 @@ def searchTMDB(title: str, title_data: dict, file_name: str, item_name: str = ""
 
     return metadata
 
-def searchMetadata(query: str, title_data: dict, file_name: str, full_title: str, hash: str, item_name: str, folder_name: str = "", cache_key: str | None = None):
+def searchMetadata(query: str, title_data: dict, file_name: str, full_title: str, hash: str, item_name: str, folder_name: str = "", cache_key: str | None = None, torrent_id=None):
     base_metadata = {
         "metadata_title": cleanTitle(query),
         "metadata_link": None,
@@ -561,7 +612,9 @@ def searchMetadata(query: str, title_data: dict, file_name: str, full_title: str
         if cached_result is not None:
             cached_metadata, cached_success, cached_detail = cached_result
             logging.debug(f"Metadata cache hit for key {cache_key}")
+            _bump_cache_hit()
             return cached_metadata, cached_success, f"Metadata cache hit. {cached_detail}"
+        _bump_cache_miss()
 
     # Try TMDB — torrent/folder name first, file name only as fallback.
     folder_title_data = PTN.parse(item_name) if item_name else {}
@@ -577,7 +630,7 @@ def searchMetadata(query: str, title_data: dict, file_name: str, full_title: str
     # a range like [1,2,3,...8] which is the whole series, not the specific episode.
 
     # 1. Search with torrent/folder name first
-    tmdb_result = searchTMDB(folder_query, folder_merged_data, file_name, item_name=item_name, folder_name=folder_name)
+    tmdb_result = searchTMDB(folder_query, folder_merged_data, file_name, item_name=item_name, folder_name=folder_name, torrent_id=torrent_id)
     if tmdb_result is not None:
         base_metadata.update(tmdb_result)
         return cacheAndReturn(base_metadata, True, f"TMDB match via torrent name (score: {tmdb_result.get('metadata_tmdb_score')}). Searching for {folder_query}, item hash: {hash}")
@@ -594,11 +647,11 @@ def searchMetadata(query: str, title_data: dict, file_name: str, full_title: str
 
     if (subfolder_query and normalised_subfolder
             and normalised_subfolder != normalised_folder):
-        diag(f"  >> Retrying TMDB with subfolder name: '{subfolder_query}' (normalised: '{normalised_subfolder}')")
+        diag(f"  >> Retrying TMDB with subfolder name: '{subfolder_query}' (normalised: '{normalised_subfolder}', torrent_id={torrent_id})")
         subfolder_merged_data = {**title_data}
         if subfolder_title_data.get("year") is not None:
             subfolder_merged_data["year"] = subfolder_title_data["year"]
-        tmdb_result = searchTMDB(subfolder_query, subfolder_merged_data, file_name, item_name=item_name, folder_name=folder_name)
+        tmdb_result = searchTMDB(subfolder_query, subfolder_merged_data, file_name, item_name=item_name, folder_name=folder_name, torrent_id=torrent_id)
         if tmdb_result is not None:
             base_metadata.update(tmdb_result)
             return cacheAndReturn(base_metadata, True, f"TMDB match via subfolder name (score: {tmdb_result.get('metadata_tmdb_score')}). Searching for {subfolder_query}, item hash: {hash}")
@@ -613,8 +666,8 @@ def searchMetadata(query: str, title_data: dict, file_name: str, full_title: str
     already_tried = normalised_file_query in (normalised_folder, normalised_subfolder)
     if (file_query and not starts_with_episode_tag and not is_numeric_only
             and not already_tried):
-        diag(f"  >> Retrying TMDB with file name: '{file_query}' (normalised: '{normalised_file_query}')")
-        tmdb_result = searchTMDB(file_query, title_data, file_name, item_name=item_name, folder_name=folder_name)
+        diag(f"  >> Retrying TMDB with file name: '{file_query}' (normalised: '{normalised_file_query}', torrent_id={torrent_id})")
+        tmdb_result = searchTMDB(file_query, title_data, file_name, item_name=item_name, folder_name=folder_name, torrent_id=torrent_id)
         if tmdb_result is not None:
             base_metadata.update(tmdb_result)
             return cacheAndReturn(base_metadata, True, f"TMDB match via file name (score: {tmdb_result.get('metadata_tmdb_score')}). Searching for {file_query}, item hash: {hash}")
@@ -628,10 +681,10 @@ def searchMetadata(query: str, title_data: dict, file_name: str, full_title: str
             skip_reasons.append("normalised file title is numeric-only")
         if already_tried:
             skip_reasons.append(f"same as already-tried query ('{normalised_file_query}')")
-        diag(f"  >> File fallback SKIPPED: {', '.join(skip_reasons) or 'unknown'}")
+        diag(f"  >> File fallback SKIPPED (torrent_id={torrent_id}): {', '.join(skip_reasons) or 'unknown'}")
 
     # Fall back to TorBox Search API
-    diag(f"  >> Falling back to TorBox Search API for: {file_name}")
+    diag(f"  >> Falling back to TorBox Search API for: {file_name} (torrent_id={torrent_id})")
     extension = os.path.splitext(file_name)[-1]
     try:
         response = requestWrapper(search_api_http_client, "GET", f"/meta/search/{full_title}", params={"type": "file"})

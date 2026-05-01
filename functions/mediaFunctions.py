@@ -17,8 +17,14 @@ def constructSeriesTitle(season = None, episode = None, folder: bool = False):
     title_episode = None
 
     if isinstance(season, list):
-        # get first and last season
-        title_season = f"S{season[0]:02}-S{season[-1]:02}"
+        if len(season) == 1:
+            season_val = season[0]
+            if folder:
+                title_season = f"Season {season_val}"
+            else:
+                title_season = f"S{season_val:02}"
+        elif len(season) > 1:
+            title_season = f"S{season[0]:02}-S{season[-1]:02}"
     elif isinstance(season, int) or season is not None:
         if folder:
             title_season = f"Season {season}"
@@ -26,8 +32,10 @@ def constructSeriesTitle(season = None, episode = None, folder: bool = False):
             title_season = f"S{season:02}"
 
     if isinstance(episode, list):
-        # get first and last episode
-        title_episode = f"E{episode[0]:02}-E{episode[-1]:02}"
+        if len(episode) == 1:
+            title_episode = f"E{episode[0]:02}"
+        elif len(episode) > 1:
+            title_episode = f"E{episode[0]:02}-E{episode[-1]:02}"
     elif isinstance(episode, int) or episode is not None:
         title_episode = f"E{episode:02}"
 
@@ -90,6 +98,8 @@ def normaliseTitle(title: str) -> str:
     # Handles S01E02, S01EXB, S01, E08, etc. — everything after is
     # episode-specific info (episode title, scene number) not the show title.
     title = re.sub(r"\bS\d+E\S*.*", "", title, flags=re.IGNORECASE)
+    # "Season01", "Season 1", "Season.03" — and everything after (episode info)
+    title = re.sub(r"\bSeason\s*\d+\b.*", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\bS\d+\b", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\bE\d+\b", "", title, flags=re.IGNORECASE)
     # Strip #x## season×episode tags (Latin x and Cyrillic х) and everything after
