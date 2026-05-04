@@ -40,7 +40,7 @@ The TorBox Media Center allows you to easily mount your TorBox media in a no-fri
 - 'Repairing' or 'renewing' your library *(this is against TorBox ToS)*
 - Customizing downloads *(update/rename)*
 
-### 🎯 Media Acquisition *(optional)*
+### 🎯 Media Acquisition *(optional, against TorBox ToS!!!)*
 
 When enabled, the media acquisition engine automatically discovers and adds new content to your TorBox account:
 
