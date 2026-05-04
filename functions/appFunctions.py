@@ -3,14 +3,42 @@ from functions.torboxFunctions import getUserDownloads, DownloadType, _reset_dia
 from library.filesystem import MOUNT_METHOD, MOUNT_PATH
 from library.app import MOUNT_REFRESH_TIME
 from library.torbox import TORBOX_API_KEY
-from functions.databaseFunctions import getAllData, removeStaleData
+from functions.databaseFunctions import getAllData, removeStaleData, getDatabase, getDatabaseLock, upsertData
 import logging
 import os
 import threading
+from datetime import datetime, timezone
 from library.app import getCurrentVersion
 import git
 
 refresh_lock = threading.Lock()
+REFRESH_STATE_DB = "refresh_state"
+
+
+def _saveRefreshTimestamp():
+    upsertData(
+        {"key": "last_refresh", "timestamp": datetime.now(timezone.utc).isoformat()},
+        REFRESH_STATE_DB,
+        ["key"],
+    )
+
+
+def getSecondsSinceLastRefresh() -> float | None:
+    db = getDatabase(REFRESH_STATE_DB)
+    db_lock = getDatabaseLock(REFRESH_STATE_DB)
+    if db is None or db_lock is None:
+        return None
+    from tinydb import Query
+    with db_lock:
+        q = Query()
+        results = db.search(q.key == "last_refresh")
+    if not results:
+        return None
+    try:
+        ts = datetime.fromisoformat(results[0]["timestamp"])
+        return (datetime.now(timezone.utc) - ts).total_seconds()
+    except (ValueError, TypeError, KeyError):
+        return None
 
 def initializeFolders():
     folders = [MOUNT_PATH]
@@ -63,6 +91,7 @@ def runRefreshCycle(mount_method: str | None = None, include_mount_sync: bool = 
                 from functions.fuseFilesystemFunctions import requestFuseRefresh
                 requestFuseRefresh()
 
+        _saveRefreshTimestamp()
         logging.info(f"Completed {trigger} refresh cycle.")
         return True, f"Completed refresh cycle for {len(all_downloads)} downloads."
     except Exception as e:
@@ -85,6 +114,16 @@ def getAllUserDownloads():
         logging.debug(f"Fetched {len(downloads)} {download_type.value} downloads.")
     return all_downloads
 
+def _checkVersionAsync():
+    try:
+        latest_version = getLatestVersion()
+        current_version = getCurrentVersion()
+        if latest_version and latest_version != current_version:
+            logging.warning(f"!!! A new version of TorBox Media Center is available: {latest_version}. You are running version: {current_version}. Please consider updating to the latest version. !!!")
+    except Exception as e:
+        logging.debug(f"Version check failed: {e}")
+
+
 def bootUp():
     logging.debug("Booting up...")
     logging.info("Mount method: %s", MOUNT_METHOD)
@@ -92,12 +131,7 @@ def bootUp():
     logging.info("TorBox API Key: %s", TORBOX_API_KEY)
     logging.info("Mount refresh time: %s %s", MOUNT_REFRESH_TIME, "hours")
 
-    # check version
-    latest_version = getLatestVersion()
-    current_version = getCurrentVersion()
-
-    if latest_version != current_version:
-        logging.warning(f"!!! A new version of TorBox Media Center is available: {latest_version}. You are running version: {current_version}. Please consider updating to the latest version. !!!")
+    threading.Thread(target=_checkVersionAsync, daemon=True).start()
 
     initializeFolders()
 

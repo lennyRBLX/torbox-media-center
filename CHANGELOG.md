@@ -1,5 +1,42 @@
 # Changelog
 
+## [2.2.0](https://github.com/TorBox-App/torbox-media-center/compare/v2.1.0...v2.2.0) (2026-05-04)
+
+
+### Features
+
+* add TMDB metadata enrichment with fuzzy title matching for accurate movie/series naming ([83f782d](https://github.com/TorBox-App/torbox-media-center/commit/83f782d))
+* add `TMDB_DIAG_ENABLED` env var — writes verbose TMDB matching diagnostics to `tmdb_diagnostics.log`
+* add `EXCLUDE_RESOLUTIONS` env var — comma-separated list of resolutions to reject during acquisition
+* add `LibraryIndex` and `SnapshotIndex` for fast set-based dedup (multi-episode + season-pack aware, PTN-parsed TorBox filenames)
+* add deferred status with 1h retry window for items where TMDB→IMDB resolve fails
+* add curated TMDB discovery filters (skips sports, reality TV, awards shows)
+* add stream scoring by resolution + file size, with inline debrid URL verification
+
+
+### Bug Fixes
+
+* harden strm sync, scheduler, and TMDB matching ([47a6b5e](https://github.com/TorBox-App/torbox-media-center/commit/47a6b5e))
+* restart-safe scheduling — uses persisted timestamps to avoid redundant API calls on boot
+* per-database TinyDB locks and dual-TTL metadata cache (30d success / 6h transient / 7d permanent)
+* batch verify torrent/usenet creates (single sleep + single API fetch per endpoint type)
+* re-queue stale items and retry failed items after 6h cooldown
+
+## [2.1.0](https://github.com/TorBox-App/torbox-media-center/compare/v2.0.0...v2.1.0) (2026-05-03)
+
+
+### Features
+
+* add media acquisition engine with TMDB discovery and AIOStreams/usenet integration
+* add Want API HTTP endpoint for on-demand media requests (`POST /want`)
+* add TMDB discovery for now playing movies, popular series, and trending anime
+* add usenet-first acquisition via tbm.tools search with AIOStreams torrent fallback
+* add hourly discovery with persistent pagination and per-category budgets (6 movies, 20 series eps, 10 anime eps)
+* add daily reverification cycle — resets pagination every 24h and re-queues items no longer in TorBox
+* add fresh TorBox snapshot for accurate in-library checks during discovery
+* add configurable hourly acquisition budget (default 36/hr, leaving headroom for manual /want)
+* add download health monitoring (removes stalled >2min or slow downloads)
+
 ## [2.0.0](https://github.com/TorBox-App/torbox-media-center/compare/v1.4.0...v2.0.0) (2026-01-16)
 
 

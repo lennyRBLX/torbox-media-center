@@ -1,5 +1,6 @@
 from library.app import RAW_MODE
 import os
+from collections import OrderedDict
 from library.filesystem import MOUNT_PATH
 import stat
 import errno
@@ -162,7 +163,7 @@ class TorBoxMediaCenterFuse(Fuse):
         self.cached_links = {}
         self.refresh_event = threading.Event()
 
-        self.cache = {}
+        self.cache = OrderedDict()
         self.block_size = 1024 * 1024 * 64  # 64MB Blocks
         self.max_blocks = 64 # Max 64 blocks in cache (4GB)
 
@@ -259,22 +260,19 @@ class TorBoxMediaCenterFuse(Fuse):
             block_end = min((block_index + 1) * self.block_size - 1, file.get('file_size') - 1)
             current_block_size = block_end - block_offset + 1
 
-            # check for block
-            if (path, block_index) not in self.cache:
+            cache_key = (path, block_index)
+            if cache_key not in self.cache:
                 logging.debug(f"Cache miss for block {block_index}, fetching...")
-                # get block
                 block_data = downloadFile(download_link, current_block_size, block_offset)
                 if not block_data:
                     return -errno.EIO
-                # save block to cache
-                self.cache[(path, block_index)] = block_data
-                # lru cache
-                if len(self.cache) > self.max_blocks * len(self.cached_links):
-                    keys_to_remove = list(self.cache.keys())[:len(self.cache) - self.max_blocks]
-                    for key in keys_to_remove:
-                        del self.cache[key]
-            # get block from cache
-            block_data = self.cache[(path, block_index)]
+                self.cache[cache_key] = block_data
+                max_allowed = self.max_blocks * max(len(self.cached_links), 1)
+                while len(self.cache) > max_allowed:
+                    self.cache.popitem(last=False)
+            else:
+                self.cache.move_to_end(cache_key)
+            block_data = self.cache[cache_key]
 
             start_offset_in_block = max(0, offset - block_offset)
             end_offset_in_block = min(len(block_data), offset + size - block_offset)

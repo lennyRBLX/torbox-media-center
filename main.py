@@ -1,7 +1,9 @@
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.schedulers.background import BackgroundScheduler
-from functions.appFunctions import bootUp, getMountMethod, getMountRefreshTime, runRefreshCycle
+from functions.appFunctions import bootUp, getMountMethod, getMountRefreshTime, runRefreshCycle, getSecondsSinceLastRefresh
 from functions.databaseFunctions import closeAllDatabases
+from library.app import ENABLE_MEDIA_FETCH, ENABLE_WANT_API, TMDB_DISCOVER_INTERVAL, ACQUISITION_INTERVAL
+from datetime import timedelta
 import atexit
 import logging
 import os
@@ -48,16 +50,59 @@ if __name__ == "__main__":
     writePidFile()
     atexit.register(removePidFile)
 
-    runRefreshCycle(
-        mount_method=mount_method,
-        include_mount_sync=False,
-        trigger="startup",
-    )
+    if ENABLE_WANT_API:
+        from functions.apiServer import startApiServer
+        startApiServer()
 
+    refresh_interval_hours = getMountRefreshTime()
+    refresh_interval_secs = refresh_interval_hours * 3600
+    elapsed = getSecondsSinceLastRefresh()
+
+    if elapsed is None:
+        logging.info("Startup: no previous refresh recorded, running now.")
+        runRefreshCycle(mount_method=mount_method, include_mount_sync=False, trigger="startup")
+        initial_delay_secs = refresh_interval_secs
+    elif elapsed >= refresh_interval_secs:
+        logging.info(f"Startup: last refresh was {elapsed / 3600:.1f}h ago (>= {refresh_interval_hours}h), running now.")
+        runRefreshCycle(mount_method=mount_method, include_mount_sync=False, trigger="startup")
+        initial_delay_secs = refresh_interval_secs
+    else:
+        remaining = refresh_interval_secs - elapsed
+        logging.info(f"Startup: last refresh was {elapsed / 60:.0f}m ago, next in {remaining / 60:.0f}m.")
+        initial_delay_secs = remaining
+
+    if ENABLE_MEDIA_FETCH:
+        from functions.discoveryFunctions import runDiscovery
+        from functions.acquisitionFunctions import runAcquisition
+
+        runDiscovery()
+
+        scheduler.add_job(
+            runDiscovery,
+            "interval",
+            hours=TMDB_DISCOVER_INTERVAL,
+            id="run_discovery",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=60,
+        )
+        scheduler.add_job(
+            runAcquisition,
+            "interval",
+            minutes=ACQUISITION_INTERVAL,
+            id="run_acquisition",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=30,
+        )
+
+    from datetime import datetime, timezone
+    next_refresh = datetime.now(timezone.utc) + timedelta(seconds=initial_delay_secs)
     scheduler.add_job(
         runRefreshCycle,
         "interval",
-        hours=getMountRefreshTime(),
+        hours=refresh_interval_hours,
+        next_run_time=next_refresh,
         kwargs={
             "mount_method": mount_method,
             "include_mount_sync": False,

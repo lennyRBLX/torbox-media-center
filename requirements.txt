@@ -1,9 +1,11 @@
 apscheduler
 tinydb
-httpx
+httpx[http2,brotli]
 python-dotenv
 parse-torrent-title
 fuse-python; sys_platform != "win32" and sys_platform != "darwin"
 git+https://github.com/libfuse/python-fuse; sys_platform == "darwin"
 GitPython
 rapidfuzz
+fastapi>=0.111.0
+uvicorn>=0.29.0

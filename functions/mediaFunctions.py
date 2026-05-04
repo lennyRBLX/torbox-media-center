@@ -1,7 +1,25 @@
 import re
 import logging
 import unicodedata
+from functools import lru_cache
 from rapidfuzz import fuzz
+
+_RE_INVALID_CHARS = re.compile(r"[\/\\\:\*\?\"\<\>\|]")
+_RE_DASH_VARIANTS = re.compile(r"[–—−‐‑]")
+
+_RE_SE_TAG = re.compile(r"\bS\d+E\S*.*", re.IGNORECASE)
+_RE_SEASON_NUM = re.compile(r"\bSeason\s*\d+\b.*", re.IGNORECASE)
+_RE_S_TAG = re.compile(r"\bS\d+\b", re.IGNORECASE)
+_RE_E_TAG = re.compile(r"\bE\d+\b", re.IGNORECASE)
+_RE_XEP = re.compile(r"\b\d+[xх]\d+\b.*", re.IGNORECASE)
+_RE_PART_TAG = re.compile(r"\bPart\s+\d+\b.*", re.IGNORECASE)
+_RE_CHAPTER_TAG = re.compile(r"\bChapter\s+\d+\b.*", re.IGNORECASE)
+_RE_OPED_TAG = re.compile(r"\b(?:NC)?(?:OP|ED)\d*\b.*", re.IGNORECASE)
+_RE_NON_ALNUM = re.compile(r"[^a-zA-Z0-9\s]")
+_RE_YEAR_4DIGIT = re.compile(r"\b(?:19|20)\d{2}\b")
+_RE_LEADING_NUM = re.compile(r"^\d+\s+")
+_RE_MULTI_SPACE = re.compile(r"\s+")
+
 
 def constructSeriesTitle(season = None, episode = None, folder: bool = False):
     """
@@ -49,21 +67,15 @@ def constructSeriesTitle(season = None, episode = None, folder: bool = False):
         return None
 
 def cleanTitle(title: str):
-    """
-    Removes invalid characters from the title.
-    """
-    title = re.sub(r"[\/\\\:\*\?\"\<\>\|]", "", title)
+    title = _RE_INVALID_CHARS.sub("", title)
     return title
 
 def cleanYear(year: str | int | None):
-    """
-    Cleans the year listing which can be a string (2023-2024) or an int (2023).
-    """
     try:
         if not year:
             return None
         if isinstance(year, str):
-            year = re.sub(r"[–—−‐‑]", "-", year)
+            year = _RE_DASH_VARIANTS.sub("-", year)
             year = year.split("-")[0]
             year = year.strip()
             return int(year)
@@ -84,39 +96,27 @@ UMLAUT_MAP = {
     "ß": "ss",
 }
 
+@lru_cache(maxsize=8192)
 def normaliseTitle(title: str) -> str:
-    """
-    Normalises a title for fuzzy comparison.
-    Handles umlauts, diacritics, special chars — modeled after AIOStreams.
-    """
     if not title:
         return ""
     for char, replacement in UMLAUT_MAP.items():
         title = title.replace(char, replacement)
     title = title.replace("&", "and")
-    # Strip season/episode tags and everything after them.
-    # Handles S01E02, S01EXB, S01, E08, etc. — everything after is
-    # episode-specific info (episode title, scene number) not the show title.
-    title = re.sub(r"\bS\d+E\S*.*", "", title, flags=re.IGNORECASE)
-    # "Season01", "Season 1", "Season.03" — and everything after (episode info)
-    title = re.sub(r"\bSeason\s*\d+\b.*", "", title, flags=re.IGNORECASE)
-    title = re.sub(r"\bS\d+\b", "", title, flags=re.IGNORECASE)
-    title = re.sub(r"\bE\d+\b", "", title, flags=re.IGNORECASE)
-    # Strip #x## season×episode tags (Latin x and Cyrillic х) and everything after
-    title = re.sub(r"\b\d+[xх]\d+\b.*", "", title, flags=re.IGNORECASE)
-    # Strip "Part #" / "Chapter #" and everything after (season/arc indicators)
-    title = re.sub(r"\bPart\s+\d+\b.*", "", title, flags=re.IGNORECASE)
-    title = re.sub(r"\bChapter\s+\d+\b.*", "", title, flags=re.IGNORECASE)
-    # Strip OP/ED/NCOP/NCED tags (with optional number) and everything after
-    title = re.sub(r"\b(?:NC)?(?:OP|ED)\d*\b.*", "", title, flags=re.IGNORECASE)
+    title = _RE_SE_TAG.sub("", title)
+    title = _RE_SEASON_NUM.sub("", title)
+    title = _RE_S_TAG.sub("", title)
+    title = _RE_E_TAG.sub("", title)
+    title = _RE_XEP.sub("", title)
+    title = _RE_PART_TAG.sub("", title)
+    title = _RE_CHAPTER_TAG.sub("", title)
+    title = _RE_OPED_TAG.sub("", title)
     title = unicodedata.normalize("NFD", title)
     title = "".join(c for c in title if unicodedata.category(c) != "Mn")
-    title = re.sub(r"[^a-zA-Z0-9\s]", "", title)
-    # Strip standalone 4-digit years (e.g. "Firefly 2002 Serenity" -> "Firefly Serenity")
-    title = re.sub(r"\b(?:19|20)\d{2}\b", "", title)
-    # Strip leading episode number prefixes (e.g. "226 - Wizard of Odd" -> "Wizard of Odd")
-    title = re.sub(r"^\d+\s+", "", title)
-    title = re.sub(r"\s+", " ", title).strip().lower()
+    title = _RE_NON_ALNUM.sub("", title)
+    title = _RE_YEAR_4DIGIT.sub("", title)
+    title = _RE_LEADING_NUM.sub("", title)
+    title = _RE_MULTI_SPACE.sub(" ", title).strip().lower()
     return title
 
 TMDB_SCORE_THRESHOLD = 100
@@ -148,13 +148,10 @@ def scoreTmdbResult(parsed_title: str, parsed_year: int | None, parsed_season: i
     score = 0
 
     # Title score (0-115)
-    # partial_ratio catches substring matches (0-100), then an exact-match
-    # bonus (0-15) breaks ties when partial_ratio returns 100 for both a
-    # perfect match and a longer title that merely contains the query.
     breakdown["normalised_tmdb"] = normaliseTitle(breakdown["tmdb_title"])
     partial = int(fuzz.partial_ratio(breakdown["normalised_parsed"], breakdown["normalised_tmdb"]))
     exact = int(fuzz.ratio(breakdown["normalised_parsed"], breakdown["normalised_tmdb"]))
-    exact_bonus = round(exact * 15 / 100)  # scale 0-100 into 0-15
+    exact_bonus = round(exact * 15 / 100)
     title_score = partial + exact_bonus
     breakdown["title_score"] = title_score
     breakdown["title_partial"] = partial
@@ -162,8 +159,6 @@ def scoreTmdbResult(parsed_title: str, parsed_year: int | None, parsed_season: i
     score += title_score
 
     # Year score (0-50)
-    # Uses airing range if available (from detail fetch), otherwise falls
-    # back to first air/release date from search results.
     date_str = tmdb_result.get("release_date") or tmdb_result.get("first_air_date") or ""
     if date_str:
         try:
@@ -184,7 +179,6 @@ def scoreTmdbResult(parsed_title: str, parsed_year: int | None, parsed_season: i
         start = breakdown["tmdb_year"]
         end = tmdb_year_end or start
         if start <= parsed_year <= end:
-            # Parsed year falls within the show's airing range
             year_score = 50
         else:
             diff = min(abs(parsed_year - start), abs(parsed_year - end))

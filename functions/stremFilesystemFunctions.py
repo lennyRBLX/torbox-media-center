@@ -1,5 +1,7 @@
 import os
+import re
 import glob
+import hashlib
 import logging
 import threading
 from library.app import RAW_MODE
@@ -7,6 +9,10 @@ from library.filesystem import MOUNT_PATH
 from functions.appFunctions import getAllUserDownloads
 
 _runStrm_lock = threading.Lock()
+_known_strm_urls: dict[str, str] = {}
+_strm_initialized = False
+
+_PART_RE = re.compile(r"(?:cd|part|disc|disk|dvd|pt)\s*0*(\d+)", re.IGNORECASE)
 
 
 def getMountCategory(media_type: str | None):
@@ -49,24 +55,25 @@ def generateFolderPath(data: dict) -> str | None:
         return None
 
 
-def writeStremFile(strm_path: str, urls: list[str]) -> bool:
-    if not urls:
+def writeStremFile(strm_path: str, url: str) -> bool:
+    if not url:
         return False
-    content = "\n".join(urls)
+    if _known_strm_urls.get(strm_path) == url:
+        return True
     try:
         os.makedirs(os.path.dirname(strm_path), exist_ok=True)
         if os.path.exists(strm_path):
             try:
                 with open(strm_path, "r") as existing:
-                    if existing.read() == content:
+                    if existing.read() == url:
+                        _known_strm_urls[strm_path] = url
                         return True
             except OSError:
                 pass
         with open(strm_path, "w") as file:
-            file.write(content)
-        logging.debug(
-            f"Wrote strm file ({len(urls)} url{'s' if len(urls) != 1 else ''}): {strm_path}"
-        )
+            file.write(url)
+        _known_strm_urls[strm_path] = url
+        logging.debug(f"Wrote strm file: {strm_path}")
         return True
     except FileNotFoundError as e:
         logging.error(
@@ -83,7 +90,74 @@ def writeStremFile(strm_path: str, urls: list[str]) -> bool:
         return False
 
 
+def _quality_token(d: dict) -> str | None:
+    res = d.get("ptn_resolution")
+    if not res:
+        return None
+    res = str(res)
+    return "4K" if res == "2160p" else res
+
+
+def _quality_source_token(d: dict) -> str | None:
+    parts = []
+    q = _quality_token(d)
+    src = d.get("ptn_quality")
+    codec = d.get("ptn_codec")
+    if q:
+        parts.append(q)
+    if src:
+        parts.append(str(src))
+    if codec:
+        parts.append(str(codec))
+    return " ".join(parts) if parts else None
+
+
+def _group_token(d: dict) -> str | None:
+    g = d.get("ptn_group")
+    return str(g) if g else None
+
+
+def _part_token(d: dict) -> str | None:
+    p = d.get("ptn_part")
+    if p:
+        return f"cd{p}"
+    m = _PART_RE.search(d.get("file_name") or "")
+    if m:
+        return f"cd{int(m.group(1))}"
+    return None
+
+
+def _short_hash(d: dict) -> str:
+    sk = str(d.get("stable_key") or d.get("download_link") or "")
+    return hashlib.sha1(sk.encode()).hexdigest()[:6]
+
+
+def _disambiguate_group(members: list[dict]) -> dict[str, tuple[str, str]]:
+    """Return stable_key -> (mode, suffix). mode is 'stack' or 'version'."""
+    n = len(members)
+    keys = [str(d.get("stable_key")) for d in members]
+
+    parts = [_part_token(d) for d in members]
+    if all(parts) and len(set(parts)) == n:
+        return {k: ("stack", t) for k, t in zip(keys, parts)}
+
+    for strategy in (_quality_token, _quality_source_token, _group_token):
+        toks = [strategy(d) for d in members]
+        if all(toks) and len(set(toks)) == n:
+            return {k: ("version", str(t)) for k, t in zip(keys, toks)}
+
+    return {k: ("version", _short_hash(d)) for k, d in zip(keys, members)}
+
+
+def _applySuffix(file_name: str, mode: str, suffix: str) -> str:
+    stem, ext = os.path.splitext(file_name)
+    if mode == "stack":
+        return f"{stem}-{suffix}{ext}"
+    return f"{stem} - {suffix}{ext}"
+
+
 def runStrm():
+    global _strm_initialized
     if not _runStrm_lock.acquire(blocking=False):
         logging.info("Skipping runStrm because another run is already in progress.")
         return
@@ -96,44 +170,70 @@ def runStrm():
             )
             return
 
-        # Get all existing .strm files
-        existing_strm_files = set(
-            glob.glob(os.path.join(MOUNT_PATH, "**", "*.strm"), recursive=True)
-        )
+        if _strm_initialized:
+            existing_strm_files = set(_known_strm_urls.keys())
+        else:
+            existing_strm_files = set(
+                glob.glob(os.path.join(MOUNT_PATH, "**", "*.strm"), recursive=True)
+            )
+            _strm_initialized = True
 
-        path_to_urls: dict[str, list[str]] = {}
+        # Pass 1: group downloads by base strm_path
+        groups: dict[str, list[dict]] = {}
         for download in all_downloads:
             url = download.get("download_link")
             file_name = download.get("metadata_filename")
             if not url or not file_name:
                 continue
-            file_path = generateFolderPath(download)
-            if file_path is None:
+            folder = generateFolderPath(download)
+            if folder is None:
                 continue
             if RAW_MODE:
-                strm_path = os.path.join(MOUNT_PATH, file_path, f"{file_name}.strm")
+                base_strm = os.path.join(MOUNT_PATH, folder, f"{file_name}.strm")
             else:
-                mount_category = getMountCategory(download.get("metadata_mediatype"))
-                if mount_category is None:
+                cat = getMountCategory(download.get("metadata_mediatype"))
+                if cat is None:
                     continue
-                strm_path = os.path.join(
-                    MOUNT_PATH, mount_category, file_path, f"{file_name}.strm"
+                base_strm = os.path.join(
+                    MOUNT_PATH, cat, folder, f"{file_name}.strm"
                 )
-            urls = path_to_urls.setdefault(strm_path, [])
-            if url not in urls:
-                urls.append(url)
+            groups.setdefault(base_strm, []).append(download)
 
-        new_strm_files = set(path_to_urls.keys())
-        for strm_path, urls in path_to_urls.items():
-            writeStremFile(strm_path, urls)
+        # Pass 2: resolve collisions, one URL per .strm
+        path_to_url: dict[str, str] = {}
+        for base_strm, members in groups.items():
+            base_dir = os.path.dirname(base_strm)
+            if len(members) == 1:
+                path_to_url[base_strm] = members[0]["download_link"]
+                continue
+
+            if RAW_MODE:
+                # RAW_MODE paths should already be unique; if not, fall back to hash.
+                for d in members:
+                    file_name = d.get("metadata_filename")
+                    new_name = _applySuffix(file_name, "version", _short_hash(d))
+                    path_to_url[os.path.join(base_dir, f"{new_name}.strm")] = d["download_link"]
+                continue
+
+            suffixes = _disambiguate_group(members)
+            for d in members:
+                sk = str(d.get("stable_key"))
+                mode, suffix = suffixes[sk]
+                file_name = d.get("metadata_filename")
+                new_name = _applySuffix(file_name, mode, suffix)
+                path_to_url[os.path.join(base_dir, f"{new_name}.strm")] = d["download_link"]
+
+        new_strm_files = set(path_to_url.keys())
+        for strm_path, url in path_to_url.items():
+            writeStremFile(strm_path, url)
 
         # Remove .strm files for deleted downloads
         for strm_file in existing_strm_files:
             if strm_file not in new_strm_files:
                 try:
                     os.remove(strm_file)
+                    _known_strm_urls.pop(strm_file, None)
                     logging.debug(f"Removed stale .strm file: {strm_file}")
-                    # Remove empty directories
                     dir = os.path.dirname(strm_file)
                     while dir != MOUNT_PATH and not os.listdir(dir):
                         os.rmdir(dir)
@@ -141,6 +241,6 @@ def runStrm():
                 except Exception as e:
                     logging.error(f"Error removing .strm file: {e}")
 
-        logging.debug(f"Updated {len(all_downloads)} strm files.")
+        logging.debug(f"Updated {len(path_to_url)} strm files.")
     finally:
         _runStrm_lock.release()

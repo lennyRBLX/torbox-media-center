@@ -179,3 +179,12 @@ movies
 series
 test-*
 *.json
+
+# Local-only working dirs / runtime files
+CLAUDE.md
+AIOStreams-main/
+original/
+pyenv/
+.torbox-media-center.pid
+tmdb_diagnostics.log
+*.pid

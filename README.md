@@ -10,13 +10,16 @@ The TorBox Media Center allows you to easily mount your TorBox media in a no-fri
 ### ✨ Features
 
 - Organizing your media automatically, using the [TorBox Metadata Search API](https://www.postman.com/wamy-dev/torbox/request/ubj7d6v/get-metadata-by-query)
+- Optional [TMDB](https://www.themoviedb.org/) metadata enrichment with fuzzy title matching for accurate movie/series naming
 - Mounting your media simply and safely
-- Making sure your media is easily discoverable by media players
-- Fast and effecient.
+- Making sure your media is easily discoverable by media servers (Jellyfin, Emby, Plex, Infuse, VLC)
+- Fast and efficient parallel file processing with thread-safe TinyDB persistence
+- Resilient HTTP layer with retries, in-memory caching, and request collapsing
 - Proxy for files *(if your connection is slow)*
 - Compatible with all systems and OS *(when using the `strm` mount method)*
 - No limit on library size
-- Automatically updating library and mounts
+- Automatically updating library and mounts on a configurable schedule
+- Restart-safe scheduling — uses persisted timestamps to avoid redundant API calls on boot
 
 ### 🤖 Comparison to Zurg
 
@@ -35,9 +38,22 @@ The TorBox Media Center allows you to easily mount your TorBox media in a no-fri
 - Works with all types of files *(limited to video files)*
 - Gets you banned from TorBox *(developed by TorBox team)*
 - 'Repairing' or 'renewing' your library *(this is against TorBox ToS)*
-- Adding new downloads
 - Customizing downloads *(update/rename)*
-- Manage downloads *(delete)*
+
+### 🎯 Media Acquisition *(optional)*
+
+When enabled, the media acquisition engine automatically discovers and adds new content to your TorBox account:
+
+- **TMDB Discovery** — hourly discovery of now playing movies, popular series, and trending anime with persistent pagination
+- **Curated filters** — discovery skips sports, reality TV, awards shows, and other low-signal categories
+- **Daily reverification** — every 24 hours, resets pagination and verifies acquired items still exist in TorBox; re-queues any that are missing
+- **Want API** — local HTTP endpoint (`POST /want`) for on-demand requests from external tools (e.g. Loon)
+- **AIOStreams + tbm.tools** — AIOStreams addons queried in parallel for cached torrents/usenet/debrid; falls back to [tbm.tools](https://tbm.tools) usenet search for items AIOStreams can't fill
+- **Stream scoring** — streams ranked by resolution + file size, filtered by `EXCLUDE_RESOLUTIONS`, debrid URLs verified inline
+- **Rate limit aware** — configurable hourly budget (default 36/hr) with 10 active torrent cap
+- **Lifecycle management** — `pending` → `acquiring` → `acquired`, with retry cooldown for failures (6h) and deferred items (1h)
+- **Download health monitoring** — removes stalled (>2 min) or slow downloads, freeing slots for new acquisitions
+- **Library dedup** — fast set-based `LibraryIndex` (multi-episode + season pack aware) and `SnapshotIndex` (PTN-parsed TorBox filenames) prevent duplicate fetches
 
 ## 🔄 Compatibility
 
@@ -95,6 +111,42 @@ To run this project you will need to add the following environment variables to 
 `ENABLE_METADATA` This option allows you to enable scanning the metadata of your files. If this is enabled, TorBox will __attempt__ to find the correct metadata for your files in your TorBox account. This isn't perfect, so use with caution. If this option is `false` it skips scanning and places all of your video files in the `movies` folder. If it is enabled, TorBox will scan, and attempt to place your files into either the `movies` or `series` folders. Please also keep in mind that you will be subject to rate limiting of our search endpoint when using the metadata option. Seeing 429 errors will be common. Most of the time it is best to keep this option disabled unless you video player absolutely requires it. Also keep in mind, this unlocks the `instant` option, which can allow you to refresh every 6 minutes.
 
 `RAW_MODE` This option determines whether you want the raw file structure (similar to what you would see with webdav). Setting this to `true` will present the files in the original structure. If this is enabled, the `ENABLE_METADATA` option is disabled.
+
+### Media Acquisition Variables
+
+`TMDB_API_KEY` Your [TMDB](https://www.themoviedb.org/settings/api) API key. Required when `ENABLE_MEDIA_FETCH` is `true` or when using TMDB metadata enrichment for library mounting.
+
+`ENABLE_MEDIA_FETCH` Global on/off switch for the media acquisition engine. The default is `false` and is optional.
+
+`ENABLE_WANT_API` Enables the local HTTP `/want` endpoint for on-demand media requests. The default is `false` and is optional.
+
+`MEDIA_FETCH_DEBUG` Enables verbose debug logging for the acquisition engine. The default is `false` and is optional.
+
+`TBM_TOOLS_URL` Base URL for the tbm.tools usenet search API. The default is `https://tbm.tools` and is optional.
+
+`AIOSTREAMS_URLS` One or more comma-separated AIOStreams manifest URLs used as a torrent fallback source. No default. Required if `ENABLE_MEDIA_FETCH` is `true`.
+
+`TMDB_DISCOVER_INTERVAL` Hours between TMDB discovery runs. The default is `1` and is optional.
+
+`DISCOVER_MOVIES_PER_RUN` Maximum movies to queue per discovery run. The default is `6` and is optional.
+
+`DISCOVER_SERIES_EPISODES_PER_RUN` Approximate episode budget for series per discovery run. The default is `20` and is optional.
+
+`DISCOVER_ANIME_EPISODES_PER_RUN` Approximate episode budget for anime per discovery run. The default is `10` and is optional.
+
+`ENABLE_ANIME_DISCOVER` Include trending anime in TMDB discovery alongside movies and series. The default is `false` and is optional.
+
+`ACQUISITION_HOURLY_BUDGET` Maximum TorBox creates per hour for the acquisition engine. The default is `36` and is optional.
+
+`WANT_API_PORT` Port for the local Want API HTTP server. The default is `9876` and is optional.
+
+`ACQUISITION_INTERVAL` Minutes between acquisition engine runs. The default is `5` and is optional.
+
+`MIN_DOWNLOAD_SPEED_MBS` Minimum download speed in MB/s. Active downloads below this speed are removed to free slots. The default is `1` and is optional.
+
+`EXCLUDE_RESOLUTIONS` Comma-separated list of resolutions to reject during acquisition (e.g. `720p,480p`). Leave empty to allow all. Optional.
+
+`TMDB_DIAG_ENABLED` Writes verbose TMDB matching diagnostics to `tmdb_diagnostics.log` for debugging metadata enrichment. The default is `false` and is optional.
 
 ## 🐳 Running on Docker with one command (recommended)
 

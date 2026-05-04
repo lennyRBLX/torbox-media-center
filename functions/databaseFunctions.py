@@ -104,6 +104,30 @@ def upsertData(data: dict, type: str, key_fields: list[str]):
         except Exception as e:
             return False, f"Error upserting data: {e}"
 
+def batchUpsertData(records: list[dict], type: str, key_fields: list[str]):
+    db = getDatabase(type)
+    db_lock = getDatabaseLock(type)
+
+    if db is None or db_lock is None:
+        return False, "Database connection failed."
+
+    with db_lock:
+        try:
+            existing = {}
+            for record in db.all():
+                key = tuple(record.get(f) for f in key_fields)
+                existing[key] = record
+
+            for data in records:
+                key = tuple(data.get(f) for f in key_fields)
+                existing[key] = data
+
+            db.truncate()
+            db.insert_multiple(existing.values())
+            return True, f"Batch upserted {len(records)} records ({len(existing)} total)."
+        except Exception as e:
+            return False, f"Error batch upserting: {e}"
+
 def removeStaleData(type: str, valid_keys: set, key_field: str):
     db = getDatabase(type)
     db_lock = getDatabaseLock(type)
