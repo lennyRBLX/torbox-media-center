@@ -8,11 +8,14 @@ import json
 import random
 import threading
 
+log = logging.getLogger("http")
+
 TORBOX_API_URL = "https://api.torbox.app/v1/api"
 TORBOX_SEARCH_API_URL = "https://search-api.torbox.app"
 USER_AGENT = f"TorBox-Media-Center/{getCurrentVersion()} TorBox/1.0"
 CACHE_TTL = 300
-MAX_CACHE_SIZE = 2048
+MAX_CACHE_SIZE = 1024
+MAX_CACHED_BODY_BYTES = 256 * 1024
 _cache: dict[str, tuple[float, httpx.Response]] = {}
 _cache_request_count = 0
 
@@ -102,6 +105,8 @@ def _checkCache(cache_key: str):
             return cached_response
         else:
             del _cache[cache_key]
+            with _collapse_meta_lock:
+                _collapse_locks.pop(cache_key, None)
     return None
 
 
@@ -131,10 +136,15 @@ def _executeRequest(client: httpx.Client, method: str, url: str, cache_key: str 
             response.raise_for_status()
 
             if cache_key is not None:
-                _cache[cache_key] = (time.time(), response)
-                _cache_request_count += 1
-                if _cache_request_count % 200 == 0:
-                    _pruneCache()
+                try:
+                    body_size = len(response.content)
+                except Exception:
+                    body_size = 0
+                if body_size <= MAX_CACHED_BODY_BYTES:
+                    _cache[cache_key] = (time.time(), response)
+                    _cache_request_count += 1
+                    if _cache_request_count % 200 == 0:
+                        _pruneCache()
 
             return response
         except httpx.HTTPStatusError as e:
@@ -148,14 +158,14 @@ def _executeRequest(client: httpx.Client, method: str, url: str, cache_key: str 
                             wait_time = retry_after_seconds
                     except ValueError:
                         pass
-                logging.warning(f"Received 429 for {url}. Retrying in {wait_time:.2f}s...")
+                log.warning(f"429 for {url}. Retrying in {wait_time:.2f}s...")
                 time.sleep(wait_time)
             else:
-                logging.error(f"HTTP error for {url}: {e}")
+                log.error(f"HTTP error for {url}: {e}")
                 raise
         except httpx.RequestError as e:
             wait_time = backoff_factor * (2 ** attempt) * (0.5 + random.random())
-            logging.warning(f"Request error on {url}: {e}. Retrying in {wait_time:.2f}s...")
+            log.warning(f"Request error on {url}: {e}. Retrying in {wait_time:.2f}s...")
             time.sleep(wait_time)
     raise httpx.RequestError(f"Failed to complete request to {url} after {max_retries} attempts.")
 
@@ -170,14 +180,14 @@ def requestWrapper(client: httpx.Client, method: str, url: str, use_cache: bool 
 
     cached = _checkCache(cache_key)
     if cached is not None:
-        logging.debug(f"Cache hit for {url}")
+        log.debug(f"Cache hit for {url}")
         return cached
 
     collapse_lock = _getCollapseLock(cache_key)
     with collapse_lock:
         cached = _checkCache(cache_key)
         if cached is not None:
-            logging.debug(f"Cache hit (collapsed) for {url}")
+            log.debug(f"Cache hit (collapsed) for {url}")
             return cached
 
         return _executeRequest(client, method, url, cache_key, **kwargs)

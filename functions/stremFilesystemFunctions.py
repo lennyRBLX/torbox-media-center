@@ -1,18 +1,23 @@
 import os
 import re
 import glob
+import shutil
 import hashlib
 import logging
 import threading
 from library.app import RAW_MODE
 from library.filesystem import MOUNT_PATH
 from functions.appFunctions import getAllUserDownloads
+from functions.wantFunctions import forceRequeueWanted
+
+log = logging.getLogger("strm")
 
 _runStrm_lock = threading.Lock()
 _known_strm_urls: dict[str, str] = {}
 _strm_initialized = False
 
 _PART_RE = re.compile(r"(?:cd|part|disc|disk|dvd|pt)\s*0*(\d+)", re.IGNORECASE)
+_TMDB_LINK_RE = re.compile(r"themoviedb\.org/(movie|tv)/(\d+)")
 
 
 def getMountCategory(media_type: str | None):
@@ -73,20 +78,20 @@ def writeStremFile(strm_path: str, url: str) -> bool:
         with open(strm_path, "w") as file:
             file.write(url)
         _known_strm_urls[strm_path] = url
-        logging.debug(f"Wrote strm file: {strm_path}")
+        log.debug(f"Wrote strm file: {strm_path}")
         return True
     except FileNotFoundError as e:
-        logging.error(
+        log.error(
             f"Error creating strm file (likely bad naming scheme of file): {e}"
         )
         return False
     except OSError as e:
-        logging.error(
+        log.error(
             f"Error creating strm file (likely bad or missing permissions): {e}"
         )
         return False
     except Exception as e:
-        logging.error(f"Error creating strm file: {e}")
+        log.error(f"Error creating strm file: {e}")
         return False
 
 
@@ -156,16 +161,16 @@ def _applySuffix(file_name: str, mode: str, suffix: str) -> str:
     return f"{stem} - {suffix}{ext}"
 
 
-def runStrm():
+def runStrm(evicted_records: list[dict] | None = None):
     global _strm_initialized
     if not _runStrm_lock.acquire(blocking=False):
-        logging.info("Skipping runStrm because another run is already in progress.")
+        log.info("Skipping runStrm because another run is already in progress.")
         return
     try:
         all_downloads = getAllUserDownloads()
 
         if not all_downloads:
-            logging.info(
+            log.info(
                 "No downloads found in database. Skipping strm sync to avoid deleting existing files."
             )
             return
@@ -227,20 +232,86 @@ def runStrm():
         for strm_path, url in path_to_url.items():
             writeStremFile(strm_path, url)
 
-        # Remove .strm files for deleted downloads
-        for strm_file in existing_strm_files:
-            if strm_file not in new_strm_files:
-                try:
-                    os.remove(strm_file)
-                    _known_strm_urls.pop(strm_file, None)
-                    logging.debug(f"Removed stale .strm file: {strm_file}")
-                    dir = os.path.dirname(strm_file)
-                    while dir != MOUNT_PATH and not os.listdir(dir):
-                        os.rmdir(dir)
-                        dir = os.path.dirname(dir)
-                except Exception as e:
-                    logging.error(f"Error removing .strm file: {e}")
+        # Build set of dirs that any surviving .strm leads through; any dir
+        # outside this set is dead and gets rmtree'd (wipes .nfo, posters,
+        # subtitles, etc.).
+        live_dirs: set[str] = set()
+        for p in new_strm_files:
+            d = os.path.dirname(p)
+            while d and d != MOUNT_PATH:
+                if d in live_dirs:
+                    break
+                live_dirs.add(d)
+                d = os.path.dirname(d)
 
-        logging.debug(f"Updated {len(path_to_url)} strm files.")
+        for strm_file in existing_strm_files - new_strm_files:
+            try:
+                if os.path.exists(strm_file):
+                    os.remove(strm_file)
+                _known_strm_urls.pop(strm_file, None)
+                log.debug(f"Removed stale .strm file: {strm_file}")
+            except OSError as e:
+                log.error(f"Error removing .strm file {strm_file}: {e}")
+                continue
+            d = os.path.dirname(strm_file)
+            while d and d != MOUNT_PATH and d not in live_dirs:
+                if not os.path.isdir(d):
+                    d = os.path.dirname(d)
+                    continue
+                try:
+                    shutil.rmtree(d)
+                    log.debug(f"Removed stale folder: {d}")
+                except PermissionError as e:
+                    log.warning(f"Permission denied removing {d}: {e}")
+                    break
+                except OSError as e:
+                    log.error(f"Error removing folder {d}: {e}")
+                    break
+                d = os.path.dirname(d)
+
+        _requeueEvicted(evicted_records)
+
+        log.debug(f"Updated {len(path_to_url)} strm files.")
     finally:
         _runStrm_lock.release()
+
+
+def _requeueEvicted(evicted_records: list[dict] | None):
+    if not evicted_records:
+        return
+    seen: set[tuple[int, int | None]] = set()
+    requeued = 0
+    for rec in evicted_records:
+        link = rec.get("metadata_link") or ""
+        m = _TMDB_LINK_RE.search(link)
+        if not m:
+            log.debug(f"Re-want skip (no TMDB link): {rec.get('metadata_title')}")
+            continue
+        media_type = "movie" if m.group(1) == "movie" else "series"
+        tmdb_id = int(m.group(2))
+        season = rec.get("metadata_season")
+        if isinstance(season, list):
+            season = season[0] if season else None
+        season = season if isinstance(season, int) else None
+        key = (tmdb_id, season)
+        if key in seen:
+            continue
+        seen.add(key)
+        seasons_needed = [season] if season is not None else None
+        title = rec.get("metadata_title")
+        year_raw = rec.get("metadata_years")
+        year = year_raw if isinstance(year_raw, int) else None
+        ok, _ = forceRequeueWanted(
+            tmdb_id=tmdb_id,
+            media_type=media_type,
+            title=title,
+            year=year,
+            seasons_needed=seasons_needed,
+        )
+        if ok:
+            requeued += 1
+            log.info(
+                f"Re-wanted '{title}' S{season} (TMDB {tmdb_id}) after eviction."
+            )
+    if requeued:
+        log.info(f"Re-queued {requeued} evicted titles for re-acquisition.")

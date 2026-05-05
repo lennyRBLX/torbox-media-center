@@ -136,6 +136,10 @@ To run this project you will need to add the following environment variables to 
 
 `ENABLE_ANIME_DISCOVER` Include trending anime in TMDB discovery alongside movies and series. The default is `false` and is optional.
 
+`ENABLE_TRENDING_DISCOVER` Pull TMDB `/trending/all/week` (mixed movies + series) at the start of every discovery run. Trending items are pushed into the want queue ahead of all other catalogs and acquired first. The default is `true` and is optional.
+
+`DISCOVER_TRENDING_ITEMS_PER_RUN` Maximum trending items (combined movies + series) to queue per discovery run, taken from page 1 only. The default is `10` and is optional.
+
 `ACQUISITION_HOURLY_BUDGET` Maximum TorBox creates per hour for the acquisition engine. The default is `36` and is optional.
 
 `WANT_API_PORT` Port for the local Want API HTTP server. The default is `9876` and is optional.

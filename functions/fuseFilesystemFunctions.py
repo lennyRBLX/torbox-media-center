@@ -24,6 +24,8 @@ if not hasattr(fuse, '__version__'):
 
 fuse.fuse_python_api = (0, 2)
 
+log = logging.getLogger("fuse")
+
 LINK_AGE = 3 * 60 * 60 # 3 hours
 FUSE_SERVER = None
 
@@ -161,6 +163,7 @@ class TorBoxMediaCenterFuse(Fuse):
         self.file_handles = {}
         self.next_handle = 1
         self.cached_links = {}
+        self.cached_links_lock = threading.Lock()
         self.refresh_event = threading.Event()
 
         self.cache = OrderedDict()
@@ -175,7 +178,21 @@ class TorBoxMediaCenterFuse(Fuse):
             return
         self.files = files
         self.vfs = VirtualFileSystem(self.files)
-        logging.debug(f"Updated {len(self.files)} files in VFS")
+        self._pruneCachedLinks()
+        log.debug(f"Updated {len(self.files)} files in VFS")
+
+    def _pruneCachedLinks(self):
+        now = time.time()
+        valid_paths = set(self.vfs.file_map.keys())
+        with self.cached_links_lock:
+            stale = [
+                p for p, entry in self.cached_links.items()
+                if p not in valid_paths or now - entry["timestamp"] > LINK_AGE
+            ]
+            for p in stale:
+                del self.cached_links[p]
+        if stale:
+            log.debug(f"Pruned {len(stale)} stale cached_links entries")
 
     def requestRefresh(self):
         self.refresh_event.set()
@@ -228,27 +245,28 @@ class TorBoxMediaCenterFuse(Fuse):
             return -errno.EACCES
 
     def read(self, path, size, offset):
-        logging.debug(f"READ Path: {path}")
-        logging.debug(f"READ Size: {size}")
-        logging.debug(f"READ Offset: {offset}")
+        log.debug(f"READ Path: {path}")
+        log.debug(f"READ Size: {size}")
+        log.debug(f"READ Offset: {offset}")
         file = self.vfs.get_file(path)
 
         if not file:
             return -errno.ENOENT
 
         current_time = time.time()
-        if path not in self.cached_links:
-            self.cached_links[path] = {
-                'link': getDownloadLink(file.get('download_link')),
-                'timestamp': current_time
-            }
-        elif current_time - self.cached_links[path]['timestamp'] > LINK_AGE:
+        with self.cached_links_lock:
+            entry = self.cached_links.get(path)
+            if entry is not None and current_time - entry['timestamp'] <= LINK_AGE:
+                download_link = entry['link']
+            else:
+                download_link = None
+        if download_link is None:
             download_link = getDownloadLink(file.get('download_link'))
-            self.cached_links[path] = {
-                'link': download_link,
-                'timestamp': current_time
-            }
-        download_link = self.cached_links[path]['link']
+            with self.cached_links_lock:
+                self.cached_links[path] = {
+                    'link': download_link,
+                    'timestamp': current_time,
+                }
 
         start_block = offset // self.block_size
         end_block = (offset + size - 1) // self.block_size
@@ -262,13 +280,12 @@ class TorBoxMediaCenterFuse(Fuse):
 
             cache_key = (path, block_index)
             if cache_key not in self.cache:
-                logging.debug(f"Cache miss for block {block_index}, fetching...")
+                log.debug(f"Cache miss for block {block_index}, fetching...")
                 block_data = downloadFile(download_link, current_block_size, block_offset)
                 if not block_data:
                     return -errno.EIO
                 self.cache[cache_key] = block_data
-                max_allowed = self.max_blocks * max(len(self.cached_links), 1)
-                while len(self.cache) > max_allowed:
+                while len(self.cache) > self.max_blocks:
                     self.cache.popitem(last=False)
             else:
                 self.cache.move_to_end(cache_key)
@@ -315,7 +332,7 @@ def runFuse():
     try:
         server.fuse_args.mountpoint = MOUNT_PATH # type: ignore[assignment]
     except OSError as e:
-        logging.error(f"Error changing directory: {e}")
+        log.error(f"Error changing directory: {e}")
         sys.exit(1)
 
     try:
@@ -325,17 +342,17 @@ def runFuse():
 
 def requestFuseRefresh():
     if FUSE_SERVER is None:
-        logging.debug("FUSE server is not running. Skipping immediate VFS refresh request.")
+        log.debug("FUSE server is not running. Skipping immediate VFS refresh request.")
         return False
 
     FUSE_SERVER.requestRefresh()
-    logging.info("Requested immediate FUSE VFS refresh.")
+    log.info("Requested immediate FUSE VFS refresh.")
     return True
 
 def unmountFuse():
     try:
         os.system("fusermount -u " + MOUNT_PATH)
     except OSError as e:
-        logging.error(f"Error unmounting: {e}")
+        log.error(f"Error unmounting: {e}")
         sys.exit(1)
-    logging.info("Unmounted successfully.")
+    log.info("Unmounted successfully.")

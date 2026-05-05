@@ -3,6 +3,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from functions.appFunctions import bootUp, getMountMethod, getMountRefreshTime, runRefreshCycle, getSecondsSinceLastRefresh
 from functions.databaseFunctions import closeAllDatabases
 from library.app import ENABLE_MEDIA_FETCH, ENABLE_WANT_API, TMDB_DISCOVER_INTERVAL, ACQUISITION_INTERVAL
+from library.profiling import _reset_profile_log, _close_profile_log
 from datetime import timedelta
 import atexit
 import logging
@@ -13,24 +14,26 @@ PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".torbox-med
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s',
+    format='%(asctime)s,%(msecs)03d [%(name)s] %(levelname)s %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+log = logging.getLogger("boot")
 
 def writePidFile():
     try:
         with open(PID_FILE, "w") as pid_file:
             pid_file.write(str(os.getpid()))
     except OSError as e:
-        logging.warning(f"Unable to write PID file: {e}")
+        log.warning(f"Unable to write PID file: {e}")
 
 def removePidFile():
     try:
         if os.path.exists(PID_FILE):
             os.remove(PID_FILE)
     except OSError as e:
-        logging.warning(f"Unable to remove PID file: {e}")
+        log.warning(f"Unable to remove PID file: {e}")
 
 if __name__ == "__main__":
     bootUp()
@@ -40,11 +43,11 @@ if __name__ == "__main__":
         scheduler = BlockingScheduler()
     elif mount_method == "fuse":
         if platform == "win32":
-            logging.error("The FUSE mount method is not supported on Windows. Please use the STRM mount method or run this application on a Linux system.")
+            log.error("FUSE mount method not supported on Windows. Use STRM or run on Linux.")
             exit(1)
         scheduler = BackgroundScheduler()
     else:
-        logging.error("Invalid mount method specified.")
+        log.error("Invalid mount method specified.")
         exit(1)
 
     writePidFile()
@@ -54,21 +57,24 @@ if __name__ == "__main__":
         from functions.apiServer import startApiServer
         startApiServer()
 
+    _reset_profile_log()
+    atexit.register(_close_profile_log)
+
     refresh_interval_hours = getMountRefreshTime()
     refresh_interval_secs = refresh_interval_hours * 3600
     elapsed = getSecondsSinceLastRefresh()
 
     if elapsed is None:
-        logging.info("Startup: no previous refresh recorded, running now.")
+        log.info("No previous refresh recorded, running now.")
         runRefreshCycle(mount_method=mount_method, include_mount_sync=False, trigger="startup")
         initial_delay_secs = refresh_interval_secs
     elif elapsed >= refresh_interval_secs:
-        logging.info(f"Startup: last refresh was {elapsed / 3600:.1f}h ago (>= {refresh_interval_hours}h), running now.")
+        log.info(f"Last refresh {elapsed / 3600:.1f}h ago (>= {refresh_interval_hours}h), running now.")
         runRefreshCycle(mount_method=mount_method, include_mount_sync=False, trigger="startup")
         initial_delay_secs = refresh_interval_secs
     else:
         remaining = refresh_interval_secs - elapsed
-        logging.info(f"Startup: last refresh was {elapsed / 60:.0f}m ago, next in {remaining / 60:.0f}m.")
+        log.info(f"Last refresh {elapsed / 60:.0f}m ago, next in {remaining / 60:.0f}m.")
         initial_delay_secs = remaining
 
     if ENABLE_MEDIA_FETCH:
@@ -115,7 +121,7 @@ if __name__ == "__main__":
     )
 
     try:
-        logging.info("Starting scheduler and mounting...")
+        log.info("Starting scheduler and mounting...")
         if mount_method == "strm":
             from functions.stremFilesystemFunctions import runStrm
             runStrm()

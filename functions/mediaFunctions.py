@@ -4,6 +4,8 @@ import unicodedata
 from functools import lru_cache
 from rapidfuzz import fuzz
 
+log = logging.getLogger("media")
+
 _RE_INVALID_CHARS = re.compile(r"[\/\\\:\*\?\"\<\>\|]")
 _RE_DASH_VARIANTS = re.compile(r"[–—−‐‑]")
 
@@ -86,7 +88,7 @@ def cleanYear(year: str | int | None):
         else:
             return None
     except Exception as e:
-        logging.error(f"Error cleaning year: {e}")
+        log.error(f"Error cleaning year: {e}")
         return None
 
 UMLAUT_MAP = {
