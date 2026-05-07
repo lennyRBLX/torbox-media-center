@@ -66,11 +66,11 @@ if __name__ == "__main__":
 
     if elapsed is None:
         log.info("No previous refresh recorded, running now.")
-        runRefreshCycle(mount_method=mount_method, include_mount_sync=False, trigger="startup")
+        runRefreshCycle(mount_method=mount_method, include_mount_sync=True, trigger="startup")
         initial_delay_secs = refresh_interval_secs
     elif elapsed >= refresh_interval_secs:
         log.info(f"Last refresh {elapsed / 3600:.1f}h ago (>= {refresh_interval_hours}h), running now.")
-        runRefreshCycle(mount_method=mount_method, include_mount_sync=False, trigger="startup")
+        runRefreshCycle(mount_method=mount_method, include_mount_sync=True, trigger="startup")
         initial_delay_secs = refresh_interval_secs
     else:
         remaining = refresh_interval_secs - elapsed
@@ -111,7 +111,7 @@ if __name__ == "__main__":
         next_run_time=next_refresh,
         kwargs={
             "mount_method": mount_method,
-            "include_mount_sync": False,
+            "include_mount_sync": True,
             "trigger": "scheduled",
         },
         id="get_all_user_downloads_fresh",
@@ -125,15 +125,6 @@ if __name__ == "__main__":
         if mount_method == "strm":
             from functions.stremFilesystemFunctions import runStrm
             runStrm()
-            scheduler.add_job(
-                runStrm,
-                "interval",
-                minutes=5,
-                id="run_strm",
-                max_instances=1,
-                coalesce=True,
-                misfire_grace_time=30,
-            )
             scheduler.start()
         elif mount_method == "fuse":
             from functions.fuseFilesystemFunctions import runFuse

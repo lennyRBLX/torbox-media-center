@@ -71,6 +71,15 @@ def getAllUserDownloadsFresh():
             log_refresh.info(f"No {download_type.value} downloads found.")
             continue
         valid_keys = {d["stable_key"] for d in downloads if d and "stable_key" in d}
+        existing_records, _, _ = getAllData(download_type.value)
+        existing_count = len(existing_records) if existing_records else 0
+        if existing_count > 0 and len(valid_keys) < existing_count * 0.5:
+            log_refresh.warning(
+                f"API returned {len(valid_keys)} keys vs {existing_count} DB records "
+                f"for {download_type.value} — skipping stale removal (possible partial response)"
+            )
+            all_downloads.extend(downloads)
+            continue
         stale, stale_success, stale_detail = removeStaleData(download_type.value, valid_keys, "stable_key")
         if not stale_success:
             log_refresh.error(f"Error removing stale {download_type.value} data: {stale_detail}")

@@ -56,12 +56,15 @@ def loadAllLocalRecords() -> dict[str, list[dict]]:
     return out
 
 
-OwnerContribution = tuple[frozenset[str], frozenset[tuple[str, int]]]
+OwnerContribution = tuple[
+    frozenset[str], frozenset[tuple[str, int]], frozenset[tuple[str, int, int]]
+]
 
 
 def _parseSnapshotItem(item: dict) -> OwnerContribution:
     titles: set[str] = set()
     seasons: set[tuple[str, int]] = set()
+    episodes: set[tuple[str, int, int]] = set()
     for field in ("name", "file_name"):
         raw = item.get(field, "")
         if not raw:
@@ -75,24 +78,40 @@ def _parseSnapshotItem(item: dict) -> OwnerContribution:
             continue
         titles.add(t)
         season = parsed.get("season")
+        episode = parsed.get("episode")
         if isinstance(season, int):
-            seasons.add((t, season))
+            if isinstance(episode, int):
+                seasons.add((t, season))
+                episodes.add((t, season, episode))
+            elif isinstance(episode, list):
+                seasons.add((t, season))
+                for e in episode:
+                    if isinstance(e, int):
+                        episodes.add((t, season, e))
+            else:
+                seasons.add((t, season))
         elif isinstance(season, list):
             for s in season:
                 if isinstance(s, int):
                     seasons.add((t, s))
-    return frozenset(titles), frozenset(seasons)
+    return frozenset(titles), frozenset(seasons), frozenset(episodes)
 
 
 def _parseLocalRecord(record: dict) -> OwnerContribution:
     m = normaliseTitle(record.get("metadata_title") or "")
     if not m:
-        return frozenset(), frozenset()
+        return frozenset(), frozenset(), frozenset()
     s = record.get("metadata_season")
     if isinstance(s, list):
         s = s[0] if s else None
-    seasons = frozenset({(m, s)}) if isinstance(s, int) else frozenset()
-    return frozenset({m}), seasons
+    if not isinstance(s, int):
+        return frozenset({m}), frozenset(), frozenset()
+    e = record.get("metadata_episode")
+    if isinstance(e, list):
+        e = e[0] if e else None
+    if isinstance(e, int):
+        return frozenset({m}), frozenset({(m, s)}), frozenset({(m, s, e)})
+    return frozenset({m}), frozenset({(m, s)}), frozenset()
 
 
 class SnapshotDelta(NamedTuple):
@@ -114,12 +133,15 @@ class SnapshotIndex:
     __slots__ = (
         "_titles",
         "_title_seasons",
+        "_title_episodes",
         "_title_refs",
         "_title_season_refs",
+        "_title_episode_refs",
         "_cloud_owners",
         "_local_owners",
         "_inflight_titles",
         "_inflight_seasons",
+        "_inflight_episodes",
         "_lock",
     )
 
@@ -130,12 +152,15 @@ class SnapshotIndex:
     ):
         self._titles: set[str] = set()
         self._title_seasons: set[tuple[str, int]] = set()
+        self._title_episodes: set[tuple[str, int, int]] = set()
         self._title_refs: dict[str, int] = {}
         self._title_season_refs: dict[tuple[str, int], int] = {}
+        self._title_episode_refs: dict[tuple[str, int, int], int] = {}
         self._cloud_owners: dict[object, OwnerContribution] = {}
         self._local_owners: dict[tuple[str, str], OwnerContribution] = {}
         self._inflight_titles: set[str] = set()
         self._inflight_seasons: set[tuple[str, int]] = set()
+        self._inflight_episodes: set[tuple[str, int, int]] = set()
         self._lock = threading.Lock()
         if snapshot:
             self.applyCloudSnapshot(snapshot)
@@ -170,6 +195,18 @@ class SnapshotIndex:
         else:
             self._title_season_refs[key] = c - 1
 
+    def _addEpisode(self, key: tuple[str, int, int]) -> None:
+        self._title_episode_refs[key] = self._title_episode_refs.get(key, 0) + 1
+        self._title_episodes.add(key)
+
+    def _dropEpisode(self, key: tuple[str, int, int]) -> None:
+        c = self._title_episode_refs.get(key, 0)
+        if c <= 1:
+            self._title_episode_refs.pop(key, None)
+            self._title_episodes.discard(key)
+        else:
+            self._title_episode_refs[key] = c - 1
+
     def applyCloudSnapshot(self, snapshot: list[dict]) -> SnapshotDelta:
         with timer("snapshot.applyCloud", items=len(snapshot)) as t:
             new_keys: set[object] = set()
@@ -186,28 +223,31 @@ class SnapshotIndex:
                 cur_keys = set(self._cloud_owners.keys())
                 removed_keys = cur_keys - new_keys
                 for key in removed_keys:
-                    titles, seasons = self._cloud_owners.pop(key)
+                    titles, seasons, episodes = self._cloud_owners.pop(key)
                     for title in titles:
                         self._dropTitle(title)
                     for season in seasons:
                         self._dropSeason(season)
+                    for episode in episodes:
+                        self._dropEpisode(episode)
                 for key, contribution in parsed_new.items():
                     self._cloud_owners[key] = contribution
-                    titles, seasons = contribution
+                    titles, seasons, episodes = contribution
                     for title in titles:
                         self._addTitle(title)
                     for season in seasons:
                         self._addSeason(season)
+                    for episode in episodes:
+                        self._addEpisode(episode)
                 self._inflight_titles.clear()
                 self._inflight_seasons.clear()
+                self._inflight_episodes.clear()
                 t["added"] = len(parsed_new)
                 t["removed"] = len(removed_keys)
                 t["titles"] = len(self._titles)
                 return SnapshotDelta(added=len(parsed_new), removed=len(removed_keys))
 
-    def applyLocalRecords(
-        self, local_records: dict[str, list[dict]]
-    ) -> SnapshotDelta:
+    def applyLocalRecords(self, local_records: dict[str, list[dict]]) -> SnapshotDelta:
         with timer("snapshot.applyLocal") as t:
             new_keys: set[tuple[str, str]] = set()
             parsed_new: dict[tuple[str, str], OwnerContribution] = {}
@@ -225,41 +265,62 @@ class SnapshotIndex:
                 cur_keys = set(self._local_owners.keys())
                 removed_keys = cur_keys - new_keys
                 for key in removed_keys:
-                    titles, seasons = self._local_owners.pop(key)
+                    titles, seasons, episodes = self._local_owners.pop(key)
                     for title in titles:
                         self._dropTitle(title)
                     for season in seasons:
                         self._dropSeason(season)
+                    for episode in episodes:
+                        self._dropEpisode(episode)
                 for key, contribution in parsed_new.items():
                     self._local_owners[key] = contribution
-                    titles, seasons = contribution
+                    titles, seasons, episodes = contribution
                     for title in titles:
                         self._addTitle(title)
                     for season in seasons:
                         self._addSeason(season)
+                    for episode in episodes:
+                        self._addEpisode(episode)
                 t["added"] = len(parsed_new)
                 t["removed"] = len(removed_keys)
                 return SnapshotDelta(added=len(parsed_new), removed=len(removed_keys))
 
-    def contains(self, title: str, season: int | None = None) -> bool:
+    def contains(
+        self, title: str, season: int | None = None, episode: int | None = None
+    ) -> bool:
         if not title:
             return False
         n = normaliseTitle(title)
         with self._lock:
-            if season is not None and (self._title_seasons or self._inflight_seasons):
+            if season is not None and episode is not None:
+                if (n, season) in self._title_seasons or (
+                    n,
+                    season,
+                ) in self._inflight_seasons:
+                    return True
+                return (n, season, episode) in self._title_episodes or (
+                    n,
+                    season,
+                    episode,
+                ) in self._inflight_episodes
+            if season is not None:
                 return (n, season) in self._title_seasons or (
                     n,
                     season,
                 ) in self._inflight_seasons
             return n in self._titles or n in self._inflight_titles
 
-    def markPresent(self, title: str, season: int | None = None) -> None:
+    def markPresent(
+        self, title: str, season: int | None = None, episode: int | None = None
+    ) -> None:
         n = normaliseTitle(title)
         if not n:
             return
         with self._lock:
             self._inflight_titles.add(n)
-            if isinstance(season, int):
+            if isinstance(season, int) and isinstance(episode, int):
+                self._inflight_episodes.add((n, season, episode))
+            elif isinstance(season, int):
                 self._inflight_seasons.add((n, season))
 
 
@@ -477,7 +538,7 @@ def isAlreadyInLibrary(
     library_index: LibraryIndex | None = None,
 ) -> bool:
     if snapshot_index is not None:
-        return snapshot_index.contains(title, season=season)
+        return snapshot_index.contains(title, season=season, episode=episode)
 
     if library_index is not None:
         return library_index.contains(title, media_type, season, episode)
@@ -524,12 +585,17 @@ def addWanted(
     with db_lock:
         q = Query()
         existing = db.search(q.tmdb_id == tmdb_id)
-        if existing and existing[0].get("status") in (
-            "acquired",
-            "acquiring",
-            "pending",
-        ):
-            return False, f"Already {existing[0]['status']}."
+        if existing:
+            cur_status = existing[0].get("status")
+            if cur_status == "acquired":
+                return False, "Already acquired."
+            if cur_status in ("pending", "acquiring") and seasons_needed:
+                cur_seasons = set(existing[0].get("seasons_needed") or [])
+                new_seasons = set(seasons_needed) - cur_seasons
+                if not new_seasons:
+                    return False, f"Already {cur_status}."
+            elif cur_status in ("pending", "acquiring"):
+                return False, f"Already {cur_status}."
 
     if imdb_id is None:
         imdb_id = resolveImdbId(tmdb_id, media_type)

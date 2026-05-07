@@ -620,11 +620,10 @@ def runDiscovery():
                 in ("trending", "nowPlaying", "popular", "anime")
             }
             if pending_catalogs:
-                outer["skipped"] = len(pending_catalogs)
+                outer["skipped_catalogs"] = sorted(pending_catalogs)
                 logger.info(
-                    f"skipping — {len(pending_catalogs)} catalogs still have pending items."
+                    f"Skipping catalogs with pending items: {sorted(pending_catalogs)}"
                 )
-                return
 
             state = _loadState()
             snapshot_index = SnapshotIndex([])
@@ -636,31 +635,47 @@ def runDiscovery():
                 state["page_anime"] = 1
                 state["last_full_reset"] = datetime.now(timezone.utc).isoformat()
 
-            with timer("runDiscovery.trending") as f:
-                trend_m, trend_s = _discoverTrendingWeek(snapshot_index)
-                f["added_movies"] = trend_m
-                f["added_series"] = trend_s
+            trend_m = trend_s = 0
+            movies = 0
+            series_eps = 0
+            anime_eps = 0
+            next_movie_page = state["page_movies"]
+            next_series_page = state["page_series"]
+            next_anime_page = state["page_anime"]
 
-            with timer("runDiscovery.nowPlayingMovies", page=state["page_movies"]) as f:
-                movies, next_movie_page = _discoverNowPlayingMovies(
-                    snapshot_index,
-                    state["page_movies"],
-                )
-                f["added"] = movies
+            if "trending" not in pending_catalogs:
+                with timer("runDiscovery.trending") as f:
+                    trend_m, trend_s = _discoverTrendingWeek(snapshot_index)
+                    f["added_movies"] = trend_m
+                    f["added_series"] = trend_s
 
-            with timer("runDiscovery.popularSeries", page=state["page_series"]) as f:
-                series_eps, next_series_page = _discoverPopularSeries(
-                    snapshot_index,
-                    state["page_series"],
-                )
-                f["added_episodes"] = series_eps
+            if "nowPlaying" not in pending_catalogs:
+                with timer(
+                    "runDiscovery.nowPlayingMovies", page=state["page_movies"]
+                ) as f:
+                    movies, next_movie_page = _discoverNowPlayingMovies(
+                        snapshot_index,
+                        state["page_movies"],
+                    )
+                    f["added"] = movies
 
-            with timer("runDiscovery.anime", page=state["page_anime"]) as f:
-                anime_eps, next_anime_page = _discoverAnime(
-                    snapshot_index,
-                    state["page_anime"],
-                )
-                f["added_episodes"] = anime_eps
+            if "popular" not in pending_catalogs:
+                with timer(
+                    "runDiscovery.popularSeries", page=state["page_series"]
+                ) as f:
+                    series_eps, next_series_page = _discoverPopularSeries(
+                        snapshot_index,
+                        state["page_series"],
+                    )
+                    f["added_episodes"] = series_eps
+
+            if "anime" not in pending_catalogs:
+                with timer("runDiscovery.anime", page=state["page_anime"]) as f:
+                    anime_eps, next_anime_page = _discoverAnime(
+                        snapshot_index,
+                        state["page_anime"],
+                    )
+                    f["added_episodes"] = anime_eps
 
             state["page_movies"] = next_movie_page
             state["page_series"] = next_series_page

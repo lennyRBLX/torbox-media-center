@@ -1,7 +1,6 @@
 import os
 import re
 import glob
-import shutil
 import hashlib
 import logging
 import threading
@@ -259,13 +258,9 @@ def runStrm(evicted_records: list[dict] | None = None):
                     d = os.path.dirname(d)
                     continue
                 try:
-                    shutil.rmtree(d)
-                    log.debug(f"Removed stale folder: {d}")
-                except PermissionError as e:
-                    log.warning(f"Permission denied removing {d}: {e}")
-                    break
-                except OSError as e:
-                    log.error(f"Error removing folder {d}: {e}")
+                    os.rmdir(d)
+                    log.debug(f"Removed empty folder: {d}")
+                except OSError:
                     break
                 d = os.path.dirname(d)
 

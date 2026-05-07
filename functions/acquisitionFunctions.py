@@ -24,7 +24,6 @@ from library.app import (
     DISCOVER_ANIME_EPISODES_PER_RUN,
     DISCOVER_TRENDING_ITEMS_PER_RUN,
     EXCLUDE_RESOLUTIONS,
-    MOUNT_REFRESH_TIME,
 )
 from tinydb import Query
 from functions.databaseFunctions import getDatabase, getDatabaseLock
@@ -189,13 +188,13 @@ def _cleanupDownloads() -> tuple[int, list[str]]:
                 should_remove = True
                 reason = f"status '{status}'"
 
-        if (
-            not should_remove
-            and speed_mbs < MIN_DOWNLOAD_SPEED_MBS
-            and status not in ("", "downloading")
-        ):
+        if not should_remove and speed_mbs < MIN_DOWNLOAD_SPEED_MBS and status != "downloading":
             should_remove = True
-            reason = f"speed {speed_mbs:.2f} MB/s < {MIN_DOWNLOAD_SPEED_MBS} MB/s"
+            reason = (
+                f"queued/idle (no download state)"
+                if not status
+                else f"speed {speed_mbs:.2f} MB/s < {MIN_DOWNLOAD_SPEED_MBS} MB/s"
+            )
 
         if should_remove and torrent_id:
             try:
@@ -387,11 +386,9 @@ def _markAcquired(
     if not title:
         return
     if snapshot_index is not None:
-        snapshot_index.markPresent(title, season)
+        snapshot_index.markPresent(title, season, episode)
     if in_flight is not None:
         in_flight.add(_normKey(title, season, episode))
-        if isinstance(season, int):
-            in_flight.add(_normKey(title, season, None))
         in_flight.add(_normKey(title, None, None))
 
 
@@ -798,12 +795,11 @@ def _episodeAlreadyHandled(
         title, "series", season=season_num, episode=ep_num
     ):
         return True
-    if snapshot_index is not None and snapshot_index.contains(title, season=season_num):
-        return True
-    if in_flight is not None and (
-        _normKey(title, season_num, ep_num) in in_flight
-        or _normKey(title, season_num, None) in in_flight
+    if snapshot_index is not None and snapshot_index.contains(
+        title, season=season_num, episode=ep_num
     ):
+        return True
+    if in_flight is not None and _normKey(title, season_num, ep_num) in in_flight:
         return True
     return False
 
@@ -847,8 +843,8 @@ def _attemptAiostreamsForEpisodes(
     confirmed_eps: set[tuple[int, int]],
     pending_verify: list[tuple[int, str, str, int, int]],
     is_absolute: bool = False,
-) -> bool:
-    """Returns budget_exhausted flag. Mutates unmet_eps, confirmed_eps, pending_verify."""
+) -> tuple[bool, set[tuple[int, int]]]:
+    """Returns (budget_exhausted, no_streams_eps). Mutates unmet_eps, confirmed_eps, pending_verify."""
     with timer("acquireSeries.aiostreams", tmdb_id=tmdb_id) as f:
         ep_jobs: list[tuple[int, int, str]] = [
             (season_num, ep_num, f"{title} S{season_num:02d}E{ep_num:02d}")
@@ -872,6 +868,7 @@ def _attemptAiostreamsForEpisodes(
 
         ep_attempts = 0
         budget_exhausted = False
+        no_streams_eps: set[tuple[int, int]] = set()
         for season_num, ep_num, ep_label, streams in search_results:
             if _getCatalogRemaining(catalog) <= 0:
                 logger.warning(
@@ -889,6 +886,9 @@ def _attemptAiostreamsForEpisodes(
                 is_absolute=is_absolute,
             ):
                 unmet_eps.discard((season_num, ep_num))
+                continue
+            if not streams:
+                no_streams_eps.add((season_num, ep_num))
                 continue
             confirmed, pending = _tryAiostreams(streams, ep_label, catalog)
             ep_attempts += 1
@@ -913,7 +913,8 @@ def _attemptAiostreamsForEpisodes(
         f["ep_attempts"] = ep_attempts
         f["confirmed"] = len(confirmed_eps)
         f["pending_verify"] = len(pending_verify)
-        return budget_exhausted
+        f["no_streams"] = len(no_streams_eps)
+        return budget_exhausted, no_streams_eps
 
 
 def _resolvePendingEpisodeVerifications(
@@ -952,9 +953,10 @@ def _attemptUsenetForEpisodes(
     snapshot_index: SnapshotIndex | None,
     in_flight: set[tuple] | None,
     is_absolute: bool = False,
-) -> bool:
-    """Returns budget_exhausted flag. Mutates unmet_eps, confirmed_eps."""
+) -> tuple[bool, set[tuple[int, int]]]:
+    """Returns (budget_exhausted, no_match_eps). Mutates unmet_eps, confirmed_eps."""
     budget_exhausted = False
+    no_match_eps: set[tuple[int, int]] = set()
     with timer("acquireSeries.usenet", tmdb_id=tmdb_id) as f:
         nzb_results: list[dict] = []
         nzb_fetched = False
@@ -992,6 +994,7 @@ def _attemptUsenetForEpisodes(
                     and n.get("title_parsed_data", {}).get("episode") == ep_num
                 ]
                 if not matched_nzbs:
+                    no_match_eps.add((season_num, ep_num))
                     continue
                 matched_nzbs.sort(key=_scoreNzb, reverse=True)
                 best = matched_nzbs[0]
@@ -1014,16 +1017,27 @@ def _attemptUsenetForEpisodes(
                     )
         f["nzbs"] = len(nzb_results)
         f["created"] = usenet_created
-    return budget_exhausted
+    return budget_exhausted, no_match_eps
 
 
 def _finalizeSeriesStatus(
-    tmdb_id: int, imdb_id: str | None, any_acquired: bool, budget_exhausted: bool
+    tmdb_id: int,
+    imdb_id: str | None,
+    any_acquired: bool,
+    budget_exhausted: bool,
+    unmet_remaining: int = 0,
+    all_on_cooldown: bool = False,
 ) -> None:
     if budget_exhausted:
         updateWantedStatus(tmdb_id, "pending")
-    elif any_acquired:
+    elif all_on_cooldown:
+        updateWantedStatus(tmdb_id, "pending")
+    elif unmet_remaining > 0 and any_acquired:
+        updateWantedStatus(tmdb_id, "pending")
+    elif unmet_remaining == 0 and any_acquired:
         updateWantedStatus(tmdb_id, "acquiring")
+    elif unmet_remaining == 0 and not any_acquired:
+        updateWantedStatus(tmdb_id, "acquired")
     elif not imdb_id:
         updateWantedStatus(
             tmdb_id, "deferred", failure_reason="IMDB ID resolve failed; will retry"
@@ -1061,6 +1075,12 @@ def _acquireSeries(
         season_episodes = _fetchAbsoluteSeasonEpisodes(absolute_group_id)
     else:
         season_episodes = _fetchSeasonEpisodes(tmdb_id, seasons_needed, title)
+    if not season_episodes and seasons_needed:
+        logger.warning(
+            f"{title}: TMDB returned no episode data for seasons {seasons_needed}; deferring."
+        )
+        updateWantedStatus(tmdb_id, "pending")
+        return False
     unmet_eps = _identifyUnmetEpisodes(
         title,
         season_episodes,
@@ -1070,10 +1090,22 @@ def _acquireSeries(
         is_absolute=is_absolute,
     )
 
+    EPISODE_FAIL_COOLDOWN = 86400
+    failed_eps_map: dict[str, str] = item.get("failed_episodes", {})
+    now_ts = datetime.now(timezone.utc)
+    original_unmet_count = len(unmet_eps)
+    unmet_eps = {
+        (s, e)
+        for s, e in unmet_eps
+        if f"{s}:{e}" not in failed_eps_map
+        or (now_ts - datetime.fromisoformat(failed_eps_map[f"{s}:{e}"])).total_seconds()
+        >= EPISODE_FAIL_COOLDOWN
+    }
+
     confirmed_eps: set[tuple[int, int]] = set()
     pending_verify: list[tuple[int, str, str, int, int]] = []
 
-    budget_exhausted = _attemptAiostreamsForEpisodes(
+    budget_exhausted, no_streams_eps = _attemptAiostreamsForEpisodes(
         title,
         tmdb_id,
         catalog,
@@ -1099,8 +1131,9 @@ def _acquireSeries(
     # tbm.tools usenet fallback matches by TMDB-standard season+episode parsed from
     # NZB titles; absolute-anime acquisition uses a virtual S1 with absolute episode
     # numbers that won't match. AIOStreams already aggregates usenet for these.
+    usenet_no_streams: set[tuple[int, int]] = set()
     if imdb_id and unmet_eps and not budget_exhausted and not is_absolute:
-        budget_exhausted = _attemptUsenetForEpisodes(
+        budget_exhausted, usenet_no_streams = _attemptUsenetForEpisodes(
             title,
             tmdb_id,
             imdb_id,
@@ -1112,8 +1145,26 @@ def _acquireSeries(
             in_flight,
         )
 
+    if is_absolute or not imdb_id:
+        all_no_streams = no_streams_eps
+    else:
+        all_no_streams = no_streams_eps & usenet_no_streams
+    if all_no_streams:
+        now_iso = now_ts.isoformat()
+        for s, e in all_no_streams:
+            failed_eps_map[f"{s}:{e}"] = now_iso
+        updateWantedField(tmdb_id, "failed_episodes", failed_eps_map)
+
     any_acquired = bool(confirmed_eps)
-    _finalizeSeriesStatus(tmdb_id, imdb_id, any_acquired, budget_exhausted)
+    all_on_cooldown = original_unmet_count > 0 and len(unmet_eps) == 0
+    _finalizeSeriesStatus(
+        tmdb_id,
+        imdb_id,
+        any_acquired,
+        budget_exhausted,
+        unmet_remaining=len(unmet_eps),
+        all_on_cooldown=all_on_cooldown,
+    )
     return any_acquired
 
 
@@ -1158,6 +1209,26 @@ def _assignOrphanedCatalogs(all_items: list[dict]):
     logger.info(f"Lifecycle: assigned catalog to {fixed} orphaned items.")
 
 
+def _seriesFullyCovered(item: dict, library_index: LibraryIndex) -> bool | None:
+    """True = every aired episode present, False = gaps exist, None = indeterminate (TMDB unavailable)."""
+    title = item.get("title", "")
+    seasons_needed = item.get("seasons_needed") or []
+    tmdb_id = item.get("tmdb_id")
+    if not seasons_needed or not tmdb_id:
+        return library_index.contains(title, "series")
+    season_eps = _fetchSeasonEpisodes(tmdb_id, seasons_needed, title)
+    if not season_eps:
+        return None
+    for s, eps in season_eps.items():
+        for ep in eps:
+            n = ep.get("episode_number")
+            if n is None:
+                continue
+            if not library_index.contains(title, "series", season=s, episode=n):
+                return False
+    return True
+
+
 def _verifyAcquiringItems(
     library_index: LibraryIndex,
     snapshot_index: SnapshotIndex | None = None,
@@ -1172,7 +1243,6 @@ def _verifyAcquiringItems(
             logger.info(f"Lifecycle: retried {retried} previously failed items.")
         return
 
-    now = datetime.now(timezone.utc)
     promoted = 0
     held = 0
     requeued = 0
@@ -1182,26 +1252,26 @@ def _verifyAcquiringItems(
         media_type = item.get("media_type", "movie")
         tmdb_id = item["tmdb_id"]
 
-        if library_index.contains(title, media_type):
+        if media_type == "movie":
+            if library_index.contains(title, media_type):
+                updateWantedStatus(tmdb_id, "acquired")
+                promoted += 1
+            elif snapshot_index is not None and snapshot_index.contains(title):
+                held += 1
+            else:
+                updateWantedStatus(tmdb_id, "pending")
+                requeued += 1
+            continue
+
+        result = _seriesFullyCovered(item, library_index)
+        if result is True:
             updateWantedStatus(tmdb_id, "acquired")
             promoted += 1
-            continue
-
-        if snapshot_index is not None and snapshot_index.contains(title):
+        elif result is False:
+            updateWantedStatus(tmdb_id, "pending")
+            requeued += 1
+        else:
             held += 1
-            continue
-
-        stale_threshold = MOUNT_REFRESH_TIME * 3600 * 2
-        last = item.get("last_attempt")
-        if last:
-            try:
-                elapsed = (now - datetime.fromisoformat(last)).total_seconds()
-                if elapsed < stale_threshold:
-                    continue
-            except (ValueError, TypeError):
-                pass
-        updateWantedStatus(tmdb_id, "pending")
-        requeued += 1
 
     if promoted or requeued or held:
         logger.info(
@@ -1211,6 +1281,65 @@ def _verifyAcquiringItems(
     retried = retryFailedWanted()
     if retried:
         logger.info(f"Lifecycle: retried {retried} previously failed items.")
+
+    _REVALIDATION_INTERVAL = 6 * 3600
+    _REVALIDATION_BATCH = 10
+    now = datetime.now(timezone.utc)
+    reverted = 0
+
+    acquired_series = [
+        i
+        for i in all_items
+        if i.get("status") == "acquired" and i.get("media_type") != "movie"
+    ]
+    stale = []
+    for item in acquired_series:
+        last_v = item.get("last_verified")
+        if last_v:
+            try:
+                if (
+                    now - datetime.fromisoformat(last_v)
+                ).total_seconds() < _REVALIDATION_INTERVAL:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        stale.append(item)
+    stale.sort(key=lambda x: x.get("last_verified") or "")
+
+    for item in stale[:_REVALIDATION_BATCH]:
+        tmdb_id = item["tmdb_id"]
+        result = _seriesFullyCovered(item, library_index)
+        if result is True:
+            updateWantedField(tmdb_id, "last_verified", now.isoformat())
+        elif result is False:
+            updateWantedStatus(tmdb_id, "pending")
+            reverted += 1
+
+    acquired_movies = [
+        i
+        for i in all_items
+        if i.get("status") == "acquired" and i.get("media_type") == "movie"
+    ]
+    for item in acquired_movies:
+        last_v = item.get("last_verified")
+        if last_v:
+            try:
+                if (
+                    now - datetime.fromisoformat(last_v)
+                ).total_seconds() < _REVALIDATION_INTERVAL:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        tmdb_id = item["tmdb_id"]
+        title = item.get("title", "")
+        if library_index.contains(title, "movie"):
+            updateWantedField(tmdb_id, "last_verified", now.isoformat())
+        else:
+            updateWantedStatus(tmdb_id, "pending")
+            reverted += 1
+
+    if reverted:
+        logger.info(f"Revalidation: {reverted} acquired items reverted to pending.")
 
 
 class AcquisitionContext(NamedTuple):
